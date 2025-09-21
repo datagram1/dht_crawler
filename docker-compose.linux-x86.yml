@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  linux-x86-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.linux-x86
+    image: dht-crawler-linux-x86
+    container_name: dht-crawler-linux-x86-builder
+    volumes:
+      - ./builds/linux/x86/Release:/output
+    command: >
+      sh -c "
+        cp /app/builds/linux/x86/Release/dht_crawler /output/ &&
+        chmod +x /output/dht_crawler &&
+        echo 'Linux x86 build copied to host'
+      "

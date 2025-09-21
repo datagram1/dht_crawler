@@ -1,0 +1,46 @@
+# Dockerfile for building x86 Linux version of DHT Crawler
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    libtorrent-rasterbar-dev \
+    libmysqlclient-dev \
+    libssl-dev \
+    git \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Create build directory
+RUN mkdir -p builds/linux/x86/Release
+
+# Configure and build
+RUN cd builds/linux/x86/Release && \
+    cmake -S ../../../.. -B . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DFORCE_PLATFORM_NAME=linux \
+    -DFORCE_ARCHITECTURE=x86 \
+    -DFORCE_PLATFORM_DIR=linux/x86 && \
+    make -j$(nproc)
+
+# Set executable permissions
+RUN chmod +x builds/linux/x86/Release/dht_crawler
+
+# Verify the build
+RUN ls -la builds/linux/x86/Release/dht_crawler && \
+    ldd builds/linux/x86/Release/dht_crawler
+
+# Set entrypoint
+CMD ["/app/builds/linux/x86/Release/dht_crawler", "--help"]

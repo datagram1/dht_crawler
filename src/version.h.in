@@ -1,0 +1,16 @@
+#pragma once
+
+// Auto-generated version information
+#define PROJECT_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define PROJECT_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define PROJECT_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define PROJECT_VERSION "@PROJECT_VERSION@"
+#define BUILD_NUMBER @BUILD_NUMBER@
+#define PLATFORM_NAME "@PLATFORM_NAME@"
+
+// Version string for display
+#define VERSION_STRING "@PROJECT_VERSION@"
+
+// Build information
+#define BUILD_DATE __DATE__
+#define BUILD_TIME __TIME__

@@ -1,0 +1,209 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "debug-macos-x86",
+            "displayName": "Debug macOS x86",
+            "description": "Debug build for macOS x86",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/macos/x86/Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Debug",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Debug",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Debug",
+                "FORCE_PLATFORM_NAME": "macos",
+                "FORCE_ARCHITECTURE": "x86",
+                "FORCE_PLATFORM_DIR": "macos/x86"
+            }
+        },
+        {
+            "name": "release-macos-x86",
+            "displayName": "Release macOS x86",
+            "description": "Release build for macOS x86",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/macos/x86/Release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Release",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Release",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/x86/Release",
+                "FORCE_PLATFORM_NAME": "macos",
+                "FORCE_ARCHITECTURE": "x86",
+                "FORCE_PLATFORM_DIR": "macos/x86"
+            }
+        },
+        {
+            "name": "debug-macos-arm",
+            "displayName": "Debug macOS ARM",
+            "description": "Debug build for macOS ARM",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/macos/arm/Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Debug",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Debug",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Debug",
+                "FORCE_PLATFORM_NAME": "macos",
+                "FORCE_ARCHITECTURE": "arm",
+                "FORCE_PLATFORM_DIR": "macos/arm"
+            }
+        },
+        {
+            "name": "release-macos-arm",
+            "displayName": "Release macOS ARM",
+            "description": "Release build for macOS ARM",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/macos/arm/Release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Release",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Release",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/macos/arm/Release",
+                "FORCE_PLATFORM_NAME": "macos",
+                "FORCE_ARCHITECTURE": "arm",
+                "FORCE_PLATFORM_DIR": "macos/arm"
+            }
+        },
+        {
+            "name": "debug-windows-x86",
+            "displayName": "Debug Windows x86",
+            "description": "Debug build for Windows x86",
+            "generator": "Visual Studio 17 2022",
+            "binaryDir": "${sourceDir}/builds/windows/x86/Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Debug",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Debug",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Debug"
+            }
+        },
+        {
+            "name": "release-windows-x86",
+            "displayName": "Release Windows x86",
+            "description": "Release build for Windows x86",
+            "generator": "Visual Studio 17 2022",
+            "binaryDir": "${sourceDir}/builds/windows/x86/Release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Release",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Release",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/windows/x86/Release"
+            }
+        },
+        {
+            "name": "debug-linux-x86",
+            "displayName": "Debug Linux x86",
+            "description": "Debug build for Linux x86",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/linux/x86/Debug",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Debug",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Debug",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Debug"
+            }
+        },
+        {
+            "name": "release-linux-x86",
+            "displayName": "Release Linux x86",
+            "description": "Release build for Linux x86",
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/builds/linux/x86/Release",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Release",
+                "CMAKE_LIBRARY_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Release",
+                "CMAKE_ARCHIVE_OUTPUT_DIRECTORY": "${sourceDir}/builds/linux/x86/Release"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "debug-macos-x86",
+            "displayName": "Build Debug macOS x86",
+            "configurePreset": "debug-macos-x86",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release-macos-x86",
+            "displayName": "Build Release macOS x86",
+            "configurePreset": "release-macos-x86",
+            "configuration": "Release"
+        },
+        {
+            "name": "debug-macos-arm",
+            "displayName": "Build Debug macOS ARM",
+            "configurePreset": "debug-macos-arm",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release-macos-arm",
+            "displayName": "Build Release macOS ARM",
+            "configurePreset": "release-macos-arm",
+            "configuration": "Release"
+        },
+        {
+            "name": "debug-windows-x86",
+            "displayName": "Build Debug Windows x86",
+            "configurePreset": "debug-windows-x86",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release-windows-x86",
+            "displayName": "Build Release Windows x86",
+            "configurePreset": "release-windows-x86",
+            "configuration": "Release"
+        },
+        {
+            "name": "debug-linux-x86",
+            "displayName": "Build Debug Linux x86",
+            "configurePreset": "debug-linux-x86",
+            "configuration": "Debug"
+        },
+        {
+            "name": "release-linux-x86",
+            "displayName": "Build Release Linux x86",
+            "configurePreset": "release-linux-x86",
+            "configuration": "Release"
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "test-debug",
+            "displayName": "Test Debug Builds",
+            "configurePreset": "debug-macos-arm",
+            "output": {
+                "outputOnFailure": true
+            }
+        },
+        {
+            "name": "test-release",
+            "displayName": "Test Release Builds",
+            "configurePreset": "release-macos-arm",
+            "output": {
+                "outputOnFailure": true
+            }
+        }
+    ],
+    "packagePresets": [
+        {
+            "name": "package-debug",
+            "displayName": "Package Debug Builds",
+            "configurePreset": "debug-macos-arm",
+            "generators": [
+                "TGZ",
+                "ZIP"
+            ]
+        },
+        {
+            "name": "package-release",
+            "displayName": "Package Release Builds",
+            "configurePreset": "release-macos-arm",
+            "generators": [
+                "TGZ",
+                "ZIP"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,54 @@
+# Dockerfile for building Windows x86 version of DHT Crawler using MinGW-w64
+FROM --platform=linux/amd64 ubuntu:22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Install build dependencies including MinGW-w64 cross-compiler
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    pkg-config \
+    git \
+    wget \
+    mingw-w64 \
+    libssl-dev \
+    libmysqlclient-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set MinGW-w64 environment
+ENV CC=x86_64-w64-mingw32-gcc
+ENV CXX=x86_64-w64-mingw32-g++
+ENV AR=x86_64-w64-mingw32-ar
+ENV RANLIB=x86_64-w64-mingw32-ranlib
+ENV STRIP=x86_64-w64-mingw32-strip
+
+# Set working directory
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Create build directory
+RUN mkdir -p builds/windows/x86/Release
+
+# Configure and build
+RUN cd builds/windows/x86/Release && \
+    cmake -S ../../../.. -B . \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DFORCE_PLATFORM_NAME=windows \
+    -DFORCE_ARCHITECTURE=x86 \
+    -DFORCE_PLATFORM_DIR=windows/x86 \
+    -DCMAKE_SYSTEM_NAME=Windows \
+    -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+    -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+    -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+    -DCMAKE_FIND_ROOT_PATH=/usr/x86_64-w64-mingw32 \
+    -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+    -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+    -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY && \
+    make -j$(nproc)
+
+# Verify the build
+RUN ls -la builds/windows/x86/Release/dht_crawler.exe
