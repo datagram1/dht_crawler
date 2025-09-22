@@ -45,6 +45,10 @@
 #include "smart_dht_crawler.hpp"
 #include "metadata_worker_pool.hpp"
 
+// Forward declarations
+std::string determineContentType(const std::vector<std::string>& file_names);
+std::string formatBytes(size_t bytes);
+
 struct DiscoveredTorrent {
     std::string info_hash;
     std::string name;
@@ -84,6 +88,7 @@ struct MySQLConfig {
     std::string database;
     int port = 3306;
     std::string metadata_hashes = ""; // Comma-delimited hashes for metadata-only mode
+    bool metadata_database_mode = false; // Enable metadata-database mode
     bool debug_mode = false; // Enable debug logging
     bool verbose_mode = false; // Enable verbose output (default is counter mode)
     bool metadata_log_mode = false; // Enable metadata-only logging (suppress all other logs)
@@ -517,6 +522,127 @@ public:
                       const std::string& additional_data = "") {
         return logError(function_name, caller_function, -1, e.what(), "", "CRITICAL", additional_data);
     }
+
+    // Metadata database mode methods
+    std::vector<std::string> getTorrentsWithMissingMetadata(int limit = 100, int offset = 0) {
+        std::vector<std::string> hashes;
+        try {
+            if (!m_connected) {
+                logError("MySQLConnection::getTorrentsWithMissingMetadata", "", -1, "Not connected to database", "", "WARNING");
+                return hashes;
+            }
+
+            std::string query = "SELECT info_hash FROM discovered_torrents "
+                               "WHERE (num_files < 1 OR num_files IS NULL) AND timed_out = 0 "
+                               "ORDER BY id ASC LIMIT " + std::to_string(limit) + " OFFSET " + std::to_string(offset);
+
+            if (mysql_query(m_connection, query.c_str())) {
+                std::string error_msg = mysql_error(m_connection);
+                logError("MySQLConnection::getTorrentsWithMissingMetadata", "", mysql_errno(m_connection), error_msg, "", "ERROR");
+                return hashes;
+            }
+
+            MYSQL_RES* result = mysql_store_result(m_connection);
+            if (!result) {
+                logError("MySQLConnection::getTorrentsWithMissingMetadata", "", mysql_errno(m_connection), "Failed to store result", "", "ERROR");
+                return hashes;
+            }
+
+            MYSQL_ROW row;
+            while ((row = mysql_fetch_row(result))) {
+                if (row[0]) {
+                    hashes.push_back(std::string(row[0]));
+                }
+            }
+
+            mysql_free_result(result);
+            return hashes;
+
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::getTorrentsWithMissingMetadata", "", e);
+            return hashes;
+        }
+    }
+
+    int getTotalTorrentsWithMissingMetadata() {
+        try {
+            if (!m_connected) {
+                logError("MySQLConnection::getTotalTorrentsWithMissingMetadata", "", -1, "Not connected to database", "", "WARNING");
+                return 0;
+            }
+
+            std::string query = "SELECT COUNT(*) FROM discovered_torrents "
+                               "WHERE (num_files < 1 OR num_files IS NULL) AND timed_out = 0";
+
+            if (mysql_query(m_connection, query.c_str())) {
+                std::string error_msg = mysql_error(m_connection);
+                logError("MySQLConnection::getTotalTorrentsWithMissingMetadata", "", mysql_errno(m_connection), error_msg, "", "ERROR");
+                return 0;
+            }
+
+            MYSQL_RES* result = mysql_store_result(m_connection);
+            if (!result) {
+                logError("MySQLConnection::getTotalTorrentsWithMissingMetadata", "", mysql_errno(m_connection), "Failed to store result", "", "ERROR");
+                return 0;
+            }
+
+            MYSQL_ROW row = mysql_fetch_row(result);
+            int count = 0;
+            if (row && row[0]) {
+                count = std::stoi(row[0]);
+            }
+
+            mysql_free_result(result);
+            return count;
+
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::getTotalTorrentsWithMissingMetadata", "", e);
+            return 0;
+        }
+    }
+
+    bool updateTorrentMetadata(const std::string& info_hash, const DiscoveredTorrent& torrent) {
+        try {
+            if (!m_connected) {
+                logError("MySQLConnection::updateTorrentMetadata", "", -1, "Not connected to database", "", "WARNING");
+                return false;
+            }
+
+            std::string query = "UPDATE discovered_torrents SET "
+                               "name = '" + escapeString(torrent.name) + "', "
+                               "size = " + std::to_string(torrent.size) + ", "
+                               "num_files = " + std::to_string(torrent.num_files) + ", "
+                               "file_names = '" + escapeString(torrent.file_names.empty() ? "" : torrent.file_names[0]) + "', "
+                               "file_sizes = '" + escapeString(torrent.file_sizes.empty() ? "" : std::to_string(torrent.file_sizes[0])) + "', "
+                               "comment = '" + escapeString(torrent.comment) + "', "
+                               "created_by = '" + escapeString(torrent.created_by) + "', "
+                               "creation_date = " + (torrent.creation_date > 0 ? "FROM_UNIXTIME(" + std::to_string(torrent.creation_date) + ")" : "NULL") + ", "
+                               "encoding = '" + escapeString(torrent.encoding) + "', "
+                               "piece_length = " + std::to_string(torrent.piece_length) + ", "
+                               "num_pieces = " + std::to_string(torrent.num_pieces) + ", "
+                               "trackers = '" + escapeString(torrent.trackers.empty() ? "" : torrent.trackers[0]) + "', "
+                               "private_torrent = " + (torrent.private_torrent ? "TRUE" : "FALSE") + ", "
+                               "content_type = '" + escapeString(torrent.content_type) + "', "
+                               "language = '" + escapeString(torrent.language) + "', "
+                               "category = '" + escapeString(torrent.category) + "', "
+                               "metadata_received = TRUE, "
+                               "timed_out = FALSE, "
+                               "updated_at = CURRENT_TIMESTAMP "
+                               "WHERE info_hash = '" + escapeString(info_hash) + "'";
+
+            if (mysql_query(m_connection, query.c_str())) {
+                std::string error_msg = mysql_error(m_connection);
+                logError("MySQLConnection::updateTorrentMetadata", "", mysql_errno(m_connection), error_msg, "", "ERROR");
+                return false;
+            }
+
+            return true;
+
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::updateTorrentMetadata", "", e, "info_hash=" + info_hash);
+            return false;
+        }
+    }
 };
 
 #endif // DISABLE_MYSQL
@@ -540,6 +666,10 @@ private:
     int m_metadata_fetched;
     bool m_metadata_only_mode;
     std::vector<std::string> m_metadata_hash_list;
+    bool m_metadata_database_mode;
+    int m_metadata_db_offset;
+    int m_metadata_db_total_records;
+    int m_metadata_db_processed;
     bool m_debug_mode;
     bool m_verbose_mode;
     bool m_metadata_log_mode;
@@ -566,7 +696,9 @@ public:
     DHTTorrentCrawler(const MySQLConfig& config) 
         : m_gen(m_rd()), m_dis(0, 255), m_running(false), m_shutdown_requested(false),
           m_total_queries(0), m_torrents_found(0), m_peers_found(0), m_metadata_fetched(0),
-          m_metadata_only_mode(false), m_debug_mode(config.debug_mode), m_verbose_mode(config.verbose_mode), m_metadata_log_mode(config.metadata_log_mode), 
+          m_metadata_only_mode(false), m_metadata_database_mode(config.metadata_database_mode), 
+          m_metadata_db_offset(0), m_metadata_db_total_records(0), m_metadata_db_processed(0),
+          m_debug_mode(config.debug_mode), m_verbose_mode(config.verbose_mode), m_metadata_log_mode(config.metadata_log_mode), 
           m_use_concurrent_mode(config.concurrent_mode), m_use_bep51_mode(config.bep51_mode), m_use_smart_mode(true) {  // Enable smart mode by default
         
         m_mysql = std::make_unique<MySQLConnection>(config);
@@ -606,52 +738,46 @@ public:
         // Initialize metadata manager
         m_metadata_manager = std::make_unique<dht_crawler::MetadataManager>(m_log_callback);
         
-        // Initialize libtorrent session
+        // *** ENHANCED SESSION CONFIGURATION FOR METADATA EXCHANGE ***
         lt::session_params params;
         lt::settings_pack& settings = params.settings;
-        
+
+        // DHT configuration
         settings.set_bool(lt::settings_pack::enable_dht, true);
         settings.set_int(lt::settings_pack::dht_announce_interval, 15);
         settings.set_int(lt::settings_pack::dht_bootstrap_nodes, 0);
-        
-        // Configure comprehensive alert mask to catch all connection-related alerts
+
+        // *** ENHANCED: Extended alert mask for metadata ***
         settings.set_int(lt::settings_pack::alert_mask, 
             lt::alert_category::dht | 
             lt::alert_category::peer | 
             lt::alert_category::status |
             lt::alert_category::connect |
             lt::alert_category::error);
-        
-        // Configure port binding for peer connections
-        // Use a specific port for port forwarding (default BitTorrent port range)
-        settings.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881"); // Listen on all interfaces, port 6881
-        
-        // Configure connection settings for better metadata fetching
-        settings.set_int(lt::settings_pack::handshake_timeout, 10);
-        settings.set_int(lt::settings_pack::peer_timeout, 120);
-        
-        // Enable local peer discovery for better peer connectivity
+
+        // Port binding
+        settings.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881");
+
+        // *** ENHANCED: Longer timeouts for metadata exchange ***
+        settings.set_int(lt::settings_pack::handshake_timeout, 30);      // Was 10s
+        settings.set_int(lt::settings_pack::peer_timeout, 180);         // Was 120s
+
+        // *** ENHANCED: Enable peer exchange and local discovery ***
         settings.set_bool(lt::settings_pack::enable_lsd, true);
-        
-        // Increase connection limits for metadata fetching
+
+        // Connection limits
         settings.set_int(lt::settings_pack::connections_limit, 200);
-        settings.set_int(lt::settings_pack::active_limit, 1000); // Increased for unlimited metadata requests
-        
-        // Enable UTP for better connectivity
+        settings.set_int(lt::settings_pack::active_limit, 1000);
+
+        // *** ENHANCED: Enable both UTP and TCP for metadata exchange ***
         settings.set_bool(lt::settings_pack::enable_outgoing_utp, true);
         settings.set_bool(lt::settings_pack::enable_incoming_utp, true);
-        
-        // Enable UPnP and NAT-PMP for automatic port forwarding
+        settings.set_bool(lt::settings_pack::enable_outgoing_tcp, true);   // *** CRITICAL ***
+        settings.set_bool(lt::settings_pack::enable_incoming_tcp, true);   // *** CRITICAL ***
+
+        // Port forwarding
         settings.set_bool(lt::settings_pack::enable_upnp, true);
         settings.set_bool(lt::settings_pack::enable_natpmp, true);
-        
-        // Configure for better connectivity with port forwarding
-        settings.set_bool(lt::settings_pack::enable_dht, true);
-        settings.set_int(lt::settings_pack::dht_announce_interval, 15);
-        
-        // Increase connection limits for better peer connectivity
-        settings.set_int(lt::settings_pack::connections_limit, 500); // Higher limit for port forwarding
-        settings.set_int(lt::settings_pack::active_limit, 1000); // Much higher limit for unlimited metadata requests
         
         m_session = std::make_unique<lt::session>(params);
         
@@ -737,6 +863,11 @@ public:
             setupMetadataOnlyMode();
         }
         
+        // Check if we're in metadata-database mode
+        if (m_mysql->getConfig().metadata_database_mode) {
+            setupMetadataDatabaseMode();
+        }
+        
         return true;
         } catch (const std::exception& e) {
             m_mysql->logException("DHTTorrentCrawler::initialize", "", e);
@@ -792,6 +923,49 @@ public:
         std::cout << "Starting metadata-only mode..." << std::endl;
     }
 
+    void setupMetadataDatabaseMode() {
+        std::cout << "\n=== METADATA-DATABASE MODE ===" << std::endl;
+        m_metadata_only_mode = true;
+        
+        // Get total count of records with missing metadata
+        int total_records = m_mysql->getTotalTorrentsWithMissingMetadata();
+        m_metadata_db_total_records = total_records;
+        std::cout << "Found " << total_records << " records with missing metadata" << std::endl;
+        
+        if (total_records == 0) {
+            std::cout << "No records found with missing metadata. Exiting." << std::endl;
+            m_shutdown_requested = true;
+            return;
+        }
+        
+        // Load initial batch of 100 records
+        loadMetadataDatabaseBatch();
+        
+        std::cout << "Starting metadata-database mode..." << std::endl;
+    }
+
+    void loadMetadataDatabaseBatch() {
+        std::vector<std::string> batch_hashes = m_mysql->getTorrentsWithMissingMetadata(100, m_metadata_db_offset);
+        
+        if (batch_hashes.empty()) {
+            std::cout << "No more records to process. All metadata fetched!" << std::endl;
+            m_shutdown_requested = true;
+            return;
+        }
+        
+        std::cout << "Loaded batch of " << batch_hashes.size() << " records (offset: " << m_metadata_db_offset << ")" << std::endl;
+        
+        // Add hashes to the metadata list
+        for (const std::string& hash : batch_hashes) {
+            m_metadata_hash_list.push_back(hash);
+            if (m_debug_mode) {
+                std::cout << "[DEBUG] Added database hash for metadata fetch: " << hash << std::endl;
+            }
+        }
+        
+        m_metadata_db_offset += batch_hashes.size();
+    }
+
     void startCrawling(int max_queries = -1) {
         if (!m_mysql->isConnected()) {
             std::cout << "MySQL not connected, running in test mode without database storage" << std::endl;
@@ -821,7 +995,36 @@ public:
                 auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
                 
                 if (m_debug_mode && elapsed_seconds % 10 == 0) {
-                    std::cout << "[DEBUG] Metadata wait: " << elapsed_seconds << "s, fetched: " << m_metadata_fetched << "/" << m_metadata_hash_list.size() << std::endl;
+                    if (m_metadata_database_mode) {
+                        std::cout << "[DEBUG] Metadata wait: " << elapsed_seconds << "s, fetched: " << m_metadata_fetched 
+                                  << "/" << m_metadata_hash_list.size() << ", processed: " << m_metadata_db_processed 
+                                  << "/" << m_metadata_db_total_records << std::endl;
+                    } else {
+                        std::cout << "[DEBUG] Metadata wait: " << elapsed_seconds << "s, fetched: " << m_metadata_fetched 
+                                  << "/" << m_metadata_hash_list.size() << std::endl;
+                    }
+                }
+                
+                // Handle timeout requests in metadata database mode
+                if (m_metadata_database_mode) {
+                    auto timed_out_requests = m_metadata_worker_pool->get_timed_out_requests();
+                    for (const auto& hash : timed_out_requests) {
+                        std::cout << "Marking hash as timed out: " << hash << std::endl;
+                        m_mysql->markTorrentTimedOut(hash);
+                    }
+                }
+                
+                // Refill queue in metadata database mode when we're running low
+                if (m_metadata_database_mode && m_metadata_hash_list.size() < 50) {
+                    loadMetadataDatabaseBatch();
+                    if (!m_metadata_hash_list.empty()) {
+                        // Request metadata for new hashes
+                        for (size_t i = m_metadata_hash_list.size() - 50; i < m_metadata_hash_list.size(); ++i) {
+                            if (i < m_metadata_hash_list.size()) {
+                                requestMetadataForHash(m_metadata_hash_list[i]);
+                            }
+                        }
+                    }
                 }
                 
                 if (elapsed_seconds >= timeout_seconds) {
@@ -829,7 +1032,14 @@ public:
                     break;
                 }
                 
-                if (m_metadata_fetched >= static_cast<int>(m_metadata_hash_list.size())) {
+                if (m_metadata_database_mode) {
+                    // In database mode, check if we've processed all records
+                    if (m_metadata_db_processed >= m_metadata_db_total_records || m_metadata_hash_list.empty()) {
+                        std::cout << "\n*** ALL DATABASE METADATA PROCESSED ***" << std::endl;
+                        std::cout << "Processed " << m_metadata_db_processed << " records successfully" << std::endl;
+                        break;
+                    }
+                } else if (m_metadata_fetched >= static_cast<int>(m_metadata_hash_list.size())) {
                     std::cout << "\n*** ALL METADATA FETCHED ***" << std::endl;
                     break;
                 }
@@ -1688,8 +1898,22 @@ private:
                 torrent.content_type = determineContentType(torrent.file_names);
                 
                 // Update in database
-                if (m_mysql->isConnected() && m_mysql->storeTorrent(torrent)) {
-                    m_metadata_fetched++;
+                bool db_success = false;
+                if (m_mysql->isConnected()) {
+                    if (m_metadata_database_mode) {
+                        // In metadata database mode, update existing record
+                        db_success = m_mysql->updateTorrentMetadata(hash_str, torrent);
+                        if (db_success) {
+                            m_metadata_db_processed++;
+                            std::cout << "Updated database record for hash: " << hash_str << std::endl;
+                        }
+                    } else {
+                        // In normal mode, store new torrent
+                        db_success = m_mysql->storeTorrent(torrent);
+                    }
+                    
+                    if (db_success) {
+                        m_metadata_fetched++;
                     
                     // Enhanced metadata logging for metadata_log_mode
                     if (m_metadata_log_mode) {
@@ -1789,6 +2013,7 @@ private:
                         std::cout << "------------------------" << std::endl;
                     }
                 }
+            }
             
             // Remove torrent from session to free resources
             m_session->remove_torrent(alert->handle);
@@ -1798,75 +2023,76 @@ private:
             m_mysql->logException("DHTTorrentCrawler::handleMetadataReceived", "", e);
         }
     }
-    
-    std::string determineContentType(const std::vector<std::string>& file_names) {
-        if (file_names.empty()) return "unknown";
-        
-        // Check file extensions to determine content type
-        std::set<std::string> extensions;
-        for (const auto& filename : file_names) {
-            size_t dot_pos = filename.find_last_of('.');
-            if (dot_pos != std::string::npos) {
-                std::string ext = filename.substr(dot_pos + 1);
-                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                extensions.insert(ext);
-            }
-        }
-        
-        // Video files
-        std::set<std::string> video_exts = {"mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp", "mpg", "mpeg"};
-        for (const auto& ext : extensions) {
-            if (video_exts.count(ext)) return "video";
-        }
-        
-        // Audio files
-        std::set<std::string> audio_exts = {"mp3", "flac", "wav", "aac", "ogg", "wma", "m4a", "opus"};
-        for (const auto& ext : extensions) {
-            if (audio_exts.count(ext)) return "audio";
-        }
-        
-        // Software/Games
-        std::set<std::string> software_exts = {"exe", "msi", "dmg", "pkg", "deb", "rpm", "app", "iso", "bin"};
-        for (const auto& ext : extensions) {
-            if (software_exts.count(ext)) return "software";
-        }
-        
-        // Documents
-        std::set<std::string> doc_exts = {"pdf", "doc", "docx", "txt", "rtf", "odt", "ppt", "pptx", "xls", "xlsx"};
-        for (const auto& ext : extensions) {
-            if (doc_exts.count(ext)) return "document";
-        }
-        
-        // Images
-        std::set<std::string> image_exts = {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "svg", "webp"};
-        for (const auto& ext : extensions) {
-            if (image_exts.count(ext)) return "image";
-        }
-        
-        // Archives
-        std::set<std::string> archive_exts = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz"};
-        for (const auto& ext : extensions) {
-            if (archive_exts.count(ext)) return "archive";
-        }
-        
-        return "other";
-    }
-    
-    std::string formatBytes(size_t bytes) {
-        const char* units[] = {"B", "KB", "MB", "GB", "TB"};
-        int unit = 0;
-        double size = static_cast<double>(bytes);
-        
-        while (size >= 1024.0 && unit < 4) {
-            size /= 1024.0;
-            unit++;
-        }
-        
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(2) << size << " " << units[unit];
-        return oss.str();
-    }
 };
+
+// Helper functions
+std::string determineContentType(const std::vector<std::string>& file_names) {
+    if (file_names.empty()) return "unknown";
+    
+    // Check file extensions to determine content type
+    std::set<std::string> extensions;
+    for (const auto& filename : file_names) {
+        size_t dot_pos = filename.find_last_of('.');
+        if (dot_pos != std::string::npos) {
+            std::string ext = filename.substr(dot_pos + 1);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            extensions.insert(ext);
+        }
+    }
+    
+    // Video files
+    std::set<std::string> video_exts = {"mp4", "avi", "mkv", "mov", "wmv", "flv", "webm", "m4v", "3gp", "mpg", "mpeg"};
+    for (const auto& ext : extensions) {
+        if (video_exts.count(ext)) return "video";
+    }
+    
+    // Audio files
+    std::set<std::string> audio_exts = {"mp3", "flac", "wav", "aac", "ogg", "wma", "m4a", "opus"};
+    for (const auto& ext : extensions) {
+        if (audio_exts.count(ext)) return "audio";
+    }
+    
+    // Software/Games
+    std::set<std::string> software_exts = {"exe", "msi", "dmg", "pkg", "deb", "rpm", "app", "iso", "bin"};
+    for (const auto& ext : extensions) {
+        if (software_exts.count(ext)) return "software";
+    }
+    
+    // Documents
+    std::set<std::string> doc_exts = {"pdf", "doc", "docx", "txt", "rtf", "odt", "ppt", "pptx", "xls", "xlsx"};
+    for (const auto& ext : extensions) {
+        if (doc_exts.count(ext)) return "document";
+    }
+    
+    // Images
+    std::set<std::string> image_exts = {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "svg", "webp"};
+    for (const auto& ext : extensions) {
+        if (image_exts.count(ext)) return "image";
+    }
+    
+    // Archives
+    std::set<std::string> archive_exts = {"zip", "rar", "7z", "tar", "gz", "bz2", "xz"};
+    for (const auto& ext : extensions) {
+        if (archive_exts.count(ext)) return "archive";
+    }
+    
+    return "other";
+}
+
+std::string formatBytes(size_t bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+    double size = static_cast<double>(bytes);
+    int unit = 0;
+    
+    while (size >= 1024.0 && unit < 4) {
+        size /= 1024.0;
+        unit++;
+    }
+    
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << size << " " << units[unit];
+    return oss.str();
+}
 
 #endif // DISABLE_LIBTORRENT
 
@@ -2061,6 +2287,9 @@ void printUsage(const char* program_name, bool test_missing_libs = false) {
     std::cout << "                    Can also be a file path (.txt or .csv) containing hashes" << std::endl;
     std::cout << "                    Example: --metadata abc123def456,789xyz012" << std::endl;
     std::cout << "                    Example: --metadata /path/to/hashes.txt" << std::endl;
+    std::cout << "  --metadata_database Process existing database records with missing metadata" << std::endl;
+    std::cout << "                    Fetches metadata for records where num_files < 1 or NULL" << std::endl;
+    std::cout << "                    Example: --metadata_database" << std::endl;
     std::cout << "  --debug           Enable detailed debug logging and verbose output" << std::endl;
     std::cout << "                    Example: --debug" << std::endl;
     std::cout << "  --verbose         Enable verbose output (default is counter mode)" << std::endl;
@@ -2097,6 +2326,9 @@ void printUsage(const char* program_name, bool test_missing_libs = false) {
     std::cout << std::endl;
     std::cout << "  # Metadata-only mode from file:" << std::endl;
     std::cout << "  " << program_name << " --user admin --password secret --database torrents --metadata /path/to/hashes.txt" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # Metadata database mode (process existing records with missing metadata):" << std::endl;
+    std::cout << "  " << program_name << " --user admin --password secret --database torrents --metadata_database" << std::endl;
     std::cout << std::endl;
     std::cout << "  # Debug mode for troubleshooting:" << std::endl;
     std::cout << "  " << program_name << " --user admin --password secret --database torrents --debug --queries 100" << std::endl;
@@ -2166,6 +2398,8 @@ int main(int argc, char* argv[]) {
             max_queries = std::stoi(argv[++i]);
         } else if (arg == "--metadata" && i + 1 < argc) {
             config.metadata_hashes = argv[++i];
+        } else if (arg == "--metadata_database") {
+            config.metadata_database_mode = true;
         } else if (arg == "--debug") {
             config.debug_mode = true;
         } else if (arg == "--verbose") {

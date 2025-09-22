@@ -13,6 +13,7 @@ A comprehensive DHT (Distributed Hash Table) crawler that discovers torrents and
 - **Multiple Operation Modes**: 
   - Normal mode: Continuous DHT crawling
   - Metadata-only mode: Fetch metadata for specific torrent hashes
+  - Metadata-database mode: Process existing database records with missing metadata
   - Concurrent mode: Parallel processing (default)
   - Sequential mode: Single-threaded processing (legacy)
 
@@ -20,9 +21,13 @@ A comprehensive DHT (Distributed Hash Table) crawler that discovers torrents and
 - **Enhanced Metadata Management**: Comprehensive torrent metadata extraction and storage
 - **Persistent Metadata Downloader**: Unlimited queue with priority-based processing
 - **Concurrent DHT Manager**: Multi-threaded worker pool for high-performance crawling
+- **BEP51 DHT Indexing**: Advanced infohash indexing for improved discovery rates
+- **Smart DHT Crawling**: Rate-limited, observation-based crawling with adaptive strategies
 - **Hash Format Support**: Handles hex, base32, and binary hash formats
-- **Content Type Detection**: Automatically categorizes torrents by file types
+- **Content Type Detection**: Automatically categorizes torrents by file types (video, audio, image, document, archive, software)
 - **Peer Discovery**: Tracks peer information and client details
+- **Database Record Processing**: Batch processing of existing records with missing metadata
+- **Timeout Management**: Intelligent timeout handling with database persistence
 - **Graceful Shutdown**: Proper cleanup and statistics reporting
 - **Signal Handling**: Responds to Ctrl+C, Ctrl+Z, and SIGTERM signals
 - **Debug Mode**: Detailed logging and verbose output for troubleshooting
@@ -114,6 +119,15 @@ make -j$(nproc)
 ./dht_crawler --user admin --password secret --database torrents --metadata /path/to/hashes.txt
 ```
 
+### Metadata-Database Mode
+```bash
+# Process existing database records with missing metadata
+./dht_crawler --user admin --password secret --database torrents --metadata_database
+
+# With debug output to monitor progress
+./dht_crawler --user admin --password secret --database torrents --metadata_database --debug --verbose
+```
+
 ### Debug Mode
 ```bash
 ./dht_crawler --user admin --password secret --database torrents --debug --queries 100
@@ -129,6 +143,22 @@ make -j$(nproc)
 ./dht_crawler --user admin --password secret --database torrents --sequential
 ```
 
+## 🔄 Operation Modes
+
+### Normal Mode (Default)
+Continuous DHT network crawling that discovers new torrents and peers in real-time.
+
+### Metadata-Only Mode
+Fetches metadata for specific torrent hashes provided via command line or file input.
+
+### Metadata-Database Mode
+Processes existing database records that have missing metadata:
+- **Target Records**: `num_files < 1 OR num_files IS NULL AND timed_out = 0`
+- **Batch Processing**: Loads 100 records initially, counting up from id=1
+- **Queue Management**: Automatically refills queue as records are processed
+- **Timeout Handling**: Marks failed records as `timed_out = 1` to skip on future runs
+- **Progress Tracking**: Shows processed vs total records with real-time statistics
+
 ## ⚙️ Command Line Options
 
 ### Required Options
@@ -141,9 +171,13 @@ make -j$(nproc)
 - `--port PORT`: MySQL server port (default: 3306)
 - `--queries NUM`: Maximum number of DHT queries to perform
 - `--metadata HASHES`: Comma-delimited torrent hashes for metadata-only mode
+- `--metadata_database`: Process existing database records with missing metadata
 - `--debug`: Enable detailed debug logging and verbose output
+- `--verbose`: Enable verbose output (default is counter mode)
+- `--metadata_log`: Enable metadata-only logging (suppress all other logs)
 - `--sequential`: Disable concurrent DHT worker pool (use sequential mode)
 - `--workers NUM`: Number of concurrent DHT workers (default: 4, max: 16)
+- `--no-bep51`: Disable BEP51 DHT infohash indexing (use random generation)
 - `--help`: Show help message and exit
 - `--test-missing-libs`: Show help with simulated missing libraries (for testing)
 
@@ -214,16 +248,24 @@ cd build && ctest --verbose
 ## 📊 Performance
 
 ### Concurrent Mode (Default)
-- **Worker Pool**: 4 concurrent DHT workers
+- **Worker Pool**: 4-16 concurrent DHT workers (configurable)
 - **Query Rate**: ~100-500 queries/second
-- **Metadata Processing**: 50 concurrent metadata requests
+- **Metadata Processing**: 50+ concurrent metadata requests with unlimited queue
 - **Memory Usage**: ~50-100MB typical
+- **BEP51 Indexing**: Enhanced discovery rates through advanced infohash indexing
+- **Smart Crawling**: Adaptive rate limiting and observation-based strategies
 
 ### Sequential Mode (Legacy)
 - **Single Thread**: Sequential DHT query processing
 - **Query Rate**: ~10-50 queries/second
 - **Metadata Processing**: 10 concurrent metadata requests
 - **Memory Usage**: ~20-50MB typical
+
+### Metadata-Database Mode
+- **Batch Processing**: 100 records per batch with automatic queue refilling
+- **Timeout Handling**: Intelligent retry logic with database persistence
+- **Progress Tracking**: Real-time statistics showing processed vs total records
+- **Resource Efficient**: Processes records without continuous DHT crawling
 
 ## 🔧 Configuration
 
@@ -265,10 +307,19 @@ pkg-config --exists mysqlclient && echo "MySQL OK" || echo "MySQL MISSING"
 - Check MySQL performance settings
 - Monitor system resources
 
+#### Metadata-Database Mode Issues
+- **No Records Found**: Check if database has records with missing metadata
+- **Slow Processing**: Enable debug mode to monitor progress and identify bottlenecks
+- **Timeout Issues**: Check network connectivity and DHT bootstrap status
+- **Database Errors**: Verify MySQL connection and table structure
+
 ### Debug Mode Output
 ```bash
 # Enable debug mode for detailed logging
 ./dht_crawler --user admin --password secret --database torrents --debug
+
+# Monitor metadata-database mode progress
+./dht_crawler --user admin --password secret --database torrents --metadata_database --debug --verbose
 ```
 
 ## 📈 Statistics
@@ -278,7 +329,10 @@ The crawler provides real-time statistics including:
 - **Torrent Discovery**: Number of torrents found
 - **Peer Discovery**: Number of peers discovered
 - **Metadata Fetching**: Success rate and processing statistics
+- **Database Processing**: Records processed vs total records (metadata-database mode)
 - **Performance Metrics**: Query rates and processing times
+- **Worker Pool Statistics**: Queue sizes, active requests, and success rates
+- **Enhanced Metadata Statistics**: Detailed breakdown of metadata operations
 
 ## 🔒 Security Considerations
 

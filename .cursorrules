@@ -23,3 +23,7 @@ When working with database-related code, use these connection parameters:
 - Always use the specified database connection details when suggesting database code
 - Consider the MySQL database schema when writing queries or suggesting database operations
 - The project appears to be focused on torrent discovery and metadata management
+
+## File Organization
+- **Test Files and Debugging Files**: All test files, debugging files, temporary scripts, and experimental code should be placed in the `./TMP` directory
+- This includes but is not limited to: test scripts, debug utilities, temporary analysis files, experimental implementations, and any files created for troubleshooting purposes
