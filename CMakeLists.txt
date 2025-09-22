@@ -62,6 +62,10 @@ else()
     if(APPLE AND FORCE_ARCHITECTURE STREQUAL "x86")
         set(CMAKE_OSX_ARCHITECTURES "x86_64")
         message(STATUS "Cross-compiling for macOS x86_64")
+        
+        # For cross-compilation, we need to disable linking to ARM64 libraries
+        # and potentially skip some dependencies that aren't available for x86_64
+        set(CROSS_COMPILING_X86 TRUE)
     endif()
 endif()
 
@@ -102,6 +106,14 @@ if(WIN32 OR FORCE_PLATFORM_NAME STREQUAL "windows")
     set(LIBTORRENT_LIBRARIES "")
     set(LIBTORRENT_INCLUDE_DIRS "")
     add_definitions(-DDISABLE_LIBTORRENT)
+elseif(CROSS_COMPILING_X86)
+    # For macOS x86 cross-compilation, skip libtorrent for now
+    # as it's not available for x86_64 on Apple Silicon
+    message(WARNING "Skipping libtorrent for macOS x86 cross-compilation")
+    set(LIBTORRENT_FOUND FALSE)
+    set(LIBTORRENT_LIBRARIES "")
+    set(LIBTORRENT_INCLUDE_DIRS "")
+    add_definitions(-DDISABLE_LIBTORRENT)
 else()
     pkg_check_modules(LIBTORRENT REQUIRED libtorrent-rasterbar)
     
@@ -118,21 +130,31 @@ else()
 endif()
 
 # Find MySQL libraries directly
-find_library(MYSQL_LIBRARY NAMES mysqlclient libmysqlclient)
-find_path(MYSQL_INCLUDE_DIR mysql/mysql.h)
-if(MYSQL_LIBRARY AND MYSQL_INCLUDE_DIR)
-    set(MYSQL_FOUND TRUE)
-    set(MYSQL_LIBRARIES ${MYSQL_LIBRARY})
-    set(MYSQL_INCLUDE_DIRS ${MYSQL_INCLUDE_DIR})
+if(CROSS_COMPILING_X86)
+    # For macOS x86 cross-compilation, skip MySQL for now
+    # as it's not available for x86_64 on Apple Silicon
+    message(WARNING "Skipping MySQL for macOS x86 cross-compilation")
+    set(MYSQL_FOUND FALSE)
+    set(MYSQL_LIBRARIES "")
+    set(MYSQL_INCLUDE_DIRS "")
+    add_definitions(-DDISABLE_MYSQL)
 else()
-    if(WIN32 OR FORCE_PLATFORM_NAME STREQUAL "windows")
-        message(WARNING "MySQL library not found. Building without MySQL support for Windows.")
-        set(MYSQL_FOUND FALSE)
-        set(MYSQL_LIBRARIES "")
-        set(MYSQL_INCLUDE_DIRS "")
-        add_definitions(-DDISABLE_MYSQL)
+    find_library(MYSQL_LIBRARY NAMES mysqlclient libmysqlclient)
+    find_path(MYSQL_INCLUDE_DIR mysql/mysql.h)
+    if(MYSQL_LIBRARY AND MYSQL_INCLUDE_DIR)
+        set(MYSQL_FOUND TRUE)
+        set(MYSQL_LIBRARIES ${MYSQL_LIBRARY})
+        set(MYSQL_INCLUDE_DIRS ${MYSQL_INCLUDE_DIR})
     else()
-        message(FATAL_ERROR "MySQL library not found. Please install MySQL development libraries.")
+        if(WIN32 OR FORCE_PLATFORM_NAME STREQUAL "windows")
+            message(WARNING "MySQL library not found. Building without MySQL support for Windows.")
+            set(MYSQL_FOUND FALSE)
+            set(MYSQL_LIBRARIES "")
+            set(MYSQL_INCLUDE_DIRS "")
+            add_definitions(-DDISABLE_MYSQL)
+        else()
+            message(FATAL_ERROR "MySQL library not found. Please install MySQL development libraries.")
+        endif()
     endif()
 endif()
 
@@ -212,8 +234,10 @@ else()
     )
 endif()
 
-# Add library search paths
-target_link_directories(dht_crawler PRIVATE /opt/homebrew/lib)
+# Add library search paths (only for native builds, not cross-compilation)
+if(NOT CROSS_COMPILING_X86)
+    target_link_directories(dht_crawler PRIVATE /opt/homebrew/lib)
+endif()
 
 # Compiler definitions
 target_compile_definitions(dht_crawler PRIVATE
@@ -291,6 +315,31 @@ install(EXPORT DHTCrawlerTargets
     DESTINATION lib/cmake/DHTCrawler
 )
 
+# =============================================================================
+# TESTING CONFIGURATION
+# =============================================================================
+
+# Enable testing if requested
+option(ENABLE_TESTING "Enable testing" OFF)
+
+if(ENABLE_TESTING)
+    # Find Google Test
+    find_package(GTest QUIET)
+    
+    if(GTest_FOUND)
+        message(STATUS "Google Test found - enabling tests")
+        enable_testing()
+        add_subdirectory(tests)
+    else()
+        message(WARNING "Google Test not found - tests disabled")
+        message(STATUS "To enable tests, install Google Test:")
+        message(STATUS "  macOS: brew install googletest")
+        message(STATUS "  Linux: sudo apt install libgtest-dev")
+    endif()
+else()
+    message(STATUS "Testing disabled - use -DENABLE_TESTING=ON to enable")
+endif()
+
 # Print build information
 message(STATUS "=== Build Configuration ===")
 message(STATUS "Version: ${PROJECT_VERSION}")
@@ -301,4 +350,5 @@ message(STATUS "Output Directory: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "LibTorrent: ${LIBTORRENT_VERSION}")
 message(STATUS "MySQL: ${MYSQL_VERSION}")
 message(STATUS "Package Config: ${CMAKE_BINARY_DIR}/DHTCrawlerConfig.cmake")
+message(STATUS "Testing: ${ENABLE_TESTING}")
 message(STATUS "========================")

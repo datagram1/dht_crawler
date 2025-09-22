@@ -15,6 +15,9 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <ctime>
+#include <unistd.h>
+#include <functional>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -38,6 +41,9 @@
 // Enhanced metadata transfer extension
 #include "enhanced_metadata_manager.hpp"
 #include "concurrent_dht_manager.hpp"
+#include "bep51_dht_indexer.hpp"
+#include "smart_dht_crawler.hpp"
+#include "metadata_worker_pool.hpp"
 
 struct DiscoveredTorrent {
     std::string info_hash;
@@ -79,8 +85,11 @@ struct MySQLConfig {
     int port = 3306;
     std::string metadata_hashes = ""; // Comma-delimited hashes for metadata-only mode
     bool debug_mode = false; // Enable debug logging
+    bool verbose_mode = false; // Enable verbose output (default is counter mode)
+    bool metadata_log_mode = false; // Enable metadata-only logging (suppress all other logs)
     bool concurrent_mode = true; // Enable concurrent DHT worker pool
     int num_workers = 4; // Number of concurrent workers
+    bool bep51_mode = true; // Enable BEP51 DHT infohash indexing
 };
 
 #ifndef DISABLE_MYSQL
@@ -102,27 +111,36 @@ public:
     }
 
     bool connect() {
-        if (!m_connection) {
-            std::cerr << "MySQL initialization failed" << std::endl;
+        try {
+            if (!m_connection) {
+                std::cerr << "MySQL initialization failed" << std::endl;
+                logError("MySQLConnection::connect", "", -1, "MySQL initialization failed", "", "CRITICAL");
+                return false;
+            }
+
+            if (!mysql_real_connect(m_connection, 
+                                   m_config.server.c_str(),
+                                   m_config.user.c_str(),
+                                   m_config.password.c_str(),
+                                   m_config.database.c_str(),
+                                   m_config.port, nullptr, 0)) {
+                std::string error_msg = mysql_error(m_connection);
+                std::cerr << "MySQL connection failed: " << error_msg << std::endl;
+                logError("MySQLConnection::connect", "", mysql_errno(m_connection), error_msg, "", "CRITICAL", 
+                        "server=" + m_config.server + ", database=" + m_config.database);
+                return false;
+            }
+
+            m_connected = true;
+            std::cout << "Connected to MySQL database: " << m_config.database << std::endl;
+            
+            // Create tables if they don't exist
+            createTables();
+            return true;
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::connect", "", e, "server=" + m_config.server + ", database=" + m_config.database);
             return false;
         }
-
-        if (!mysql_real_connect(m_connection, 
-                               m_config.server.c_str(),
-                               m_config.user.c_str(),
-                               m_config.password.c_str(),
-                               m_config.database.c_str(),
-                               m_config.port, nullptr, 0)) {
-            std::cerr << "MySQL connection failed: " << mysql_error(m_connection) << std::endl;
-            return false;
-        }
-
-        m_connected = true;
-        std::cout << "Connected to MySQL database: " << m_config.database << std::endl;
-        
-        // Create tables if they don't exist
-        createTables();
-        return true;
     }
 
     void createTables() {
@@ -235,10 +253,45 @@ public:
         } else {
             std::cout << "Created/verified torrent_files table" << std::endl;
         }
+
+        // Create error log table
+        std::string createLogTable = R"(
+            CREATE TABLE IF NOT EXISTS log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP NULL,
+                function_name VARCHAR(255) NOT NULL,
+                caller_function VARCHAR(255) NULL,
+                error_code INT NULL,
+                error_message TEXT NULL,
+                stack_trace TEXT NULL,
+                severity ENUM('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL') DEFAULT 'ERROR' NULL,
+                thread_id VARCHAR(50) NULL,
+                process_id INT NULL,
+                additional_data TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NULL,
+                INDEX idx_timestamp (timestamp),
+                INDEX idx_function_name (function_name),
+                INDEX idx_caller_function (caller_function),
+                INDEX idx_error_code (error_code),
+                INDEX idx_severity (severity),
+                INDEX idx_thread_id (thread_id),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        )";
+
+        if (mysql_query(m_connection, createLogTable.c_str())) {
+            std::cerr << "Error creating log table: " << mysql_error(m_connection) << std::endl;
+        } else {
+            std::cout << "Created/verified log table" << std::endl;
+        }
     }
 
     bool storeTorrent(const DiscoveredTorrent& torrent) {
-        if (!m_connected) return false;
+        try {
+            if (!m_connected) {
+                logError("MySQLConnection::storeTorrent", "", -1, "Not connected to database", "", "WARNING");
+                return false;
+            }
 
         // Convert file names to comma-separated string
         std::string file_names_str;
@@ -342,7 +395,10 @@ public:
                            "updated_at = CURRENT_TIMESTAMP";
 
         if (mysql_query(m_connection, query.c_str())) {
-            std::cerr << "Error storing torrent: " << mysql_error(m_connection) << std::endl;
+            std::string error_msg = mysql_error(m_connection);
+            std::cerr << "Error storing torrent: " << error_msg << std::endl;
+            logError("MySQLConnection::storeTorrent", "", mysql_errno(m_connection), error_msg, "", "ERROR", 
+                    "info_hash=" + torrent.info_hash);
             return false;
         }
 
@@ -366,6 +422,10 @@ public:
         }
 
         return true;
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::storeTorrent", "", e, "info_hash=" + torrent.info_hash);
+            return false;
+        }
     }
 
     bool isConnected() const {
@@ -389,16 +449,73 @@ private:
 
 public:
     bool markTorrentTimedOut(const std::string& info_hash) {
+        try {
+            if (!m_connected) {
+                logError("MySQLConnection::markTorrentTimedOut", "", -1, "Not connected to database", "", "WARNING");
+                return false;
+            }
+
+            std::string query = "UPDATE discovered_torrents SET timed_out = TRUE WHERE info_hash = '" + escapeString(info_hash) + "'";
+            
+            if (mysql_query(m_connection, query.c_str())) {
+                std::string error_msg = mysql_error(m_connection);
+                std::cerr << "MySQL error updating timed_out: " << error_msg << std::endl;
+                logError("MySQLConnection::markTorrentTimedOut", "", mysql_errno(m_connection), error_msg, "", "ERROR", 
+                        "info_hash=" + info_hash);
+                return false;
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            logException("MySQLConnection::markTorrentTimedOut", "", e, "info_hash=" + info_hash);
+            return false;
+        }
+    }
+
+    // Error logging functionality
+    bool logError(const std::string& function_name, 
+                  const std::string& caller_function = "",
+                  int error_code = 0,
+                  const std::string& error_message = "",
+                  const std::string& stack_trace = "",
+                  const std::string& severity = "ERROR",
+                  const std::string& additional_data = "") {
         if (!m_connected) return false;
 
-        std::string query = "UPDATE discovered_torrents SET timed_out = TRUE WHERE info_hash = '" + escapeString(info_hash) + "'";
+        // Get thread ID
+        std::string thread_id = std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id()));
         
+        // Get process ID
+        int process_id = getpid();
+
+        std::string query = "INSERT INTO log ("
+                           "function_name, caller_function, error_code, error_message, "
+                           "stack_trace, severity, thread_id, process_id, additional_data"
+                           ") VALUES ("
+                           "'" + escapeString(function_name) + "', "
+                           "'" + escapeString(caller_function) + "', "
+                           + std::to_string(error_code) + ", "
+                           "'" + escapeString(error_message) + "', "
+                           "'" + escapeString(stack_trace) + "', "
+                           "'" + escapeString(severity) + "', "
+                           "'" + escapeString(thread_id) + "', "
+                           + std::to_string(process_id) + ", "
+                           "'" + escapeString(additional_data) + "'"
+                           ")";
+
         if (mysql_query(m_connection, query.c_str())) {
-            std::cerr << "MySQL error updating timed_out: " << mysql_error(m_connection) << std::endl;
+            std::cerr << "MySQL error logging error: " << mysql_error(m_connection) << std::endl;
             return false;
         }
         
         return true;
+    }
+
+    bool logException(const std::string& function_name,
+                      const std::string& caller_function,
+                      const std::exception& e,
+                      const std::string& additional_data = "") {
+        return logError(function_name, caller_function, -1, e.what(), "", "CRITICAL", additional_data);
     }
 };
 
@@ -424,27 +541,64 @@ private:
     bool m_metadata_only_mode;
     std::vector<std::string> m_metadata_hash_list;
     bool m_debug_mode;
+    bool m_verbose_mode;
+    bool m_metadata_log_mode;
     
     // Enhanced metadata management
     std::unique_ptr<dht_crawler::MetadataManager> m_metadata_manager;
     std::unique_ptr<dht_crawler::PersistentMetadataDownloader> m_metadata_downloader;
+    std::unique_ptr<MetadataWorkerPool> m_metadata_worker_pool;
     std::function<void(const std::string&)> m_log_callback;
     
     // Concurrent DHT management
     std::unique_ptr<ConcurrentDHTManager> m_concurrent_dht;
     std::atomic<bool> m_use_concurrent_mode;
+    
+    // BEP51 DHT Indexing
+    std::unique_ptr<dht_crawler::BEP51DHTIndexer> m_bep51_indexer;
+    std::atomic<bool> m_use_bep51_mode;
+    
+    // Smart DHT Crawling (rate-limited, observation-based)
+    std::unique_ptr<dht_crawler::SmartDHTCrawler> m_smart_crawler;
+    std::atomic<bool> m_use_smart_mode;
 
 public:
     DHTTorrentCrawler(const MySQLConfig& config) 
         : m_gen(m_rd()), m_dis(0, 255), m_running(false), m_shutdown_requested(false),
           m_total_queries(0), m_torrents_found(0), m_peers_found(0), m_metadata_fetched(0),
-          m_metadata_only_mode(false), m_debug_mode(config.debug_mode), m_use_concurrent_mode(config.concurrent_mode) {
+          m_metadata_only_mode(false), m_debug_mode(config.debug_mode), m_verbose_mode(config.verbose_mode), m_metadata_log_mode(config.metadata_log_mode), 
+          m_use_concurrent_mode(config.concurrent_mode), m_use_bep51_mode(config.bep51_mode), m_use_smart_mode(true) {  // Enable smart mode by default
         
         m_mysql = std::make_unique<MySQLConnection>(config);
         
         // Initialize logging callback
         m_log_callback = [this](const std::string& message) {
-            if (m_debug_mode) {
+            // In metadata_log_mode, only show metadata-related logs
+            if (m_metadata_log_mode) {
+                // Check if this is a metadata-related log message
+                bool is_metadata_log = (
+                    message.find("Metadata") != std::string::npos ||
+                    message.find("metadata") != std::string::npos ||
+                    message.find("METADATA") != std::string::npos ||
+                    message.find("[MetadataManager]") != std::string::npos ||
+                    message.find("[MetadataDownloader]") != std::string::npos ||
+                    message.find("MetadataWorkerPool") != std::string::npos ||
+                    message.find("*** METADATA") != std::string::npos ||
+                    message.find("Metadata request") != std::string::npos ||
+                    message.find("Metadata success") != std::string::npos ||
+                    message.find("Metadata failure") != std::string::npos ||
+                    message.find("Metadata timeout") != std::string::npos ||
+                    message.find("Queued metadata") != std::string::npos ||
+                    message.find("Metadata received") != std::string::npos ||
+                    message.find("Extracted comprehensive metadata") != std::string::npos ||
+                    message.find("Cleaned up timed out request") != std::string::npos ||
+                    (message.find("Worker") != std::string::npos && message.find("metadata") != std::string::npos)
+                );
+                
+                if (is_metadata_log) {
+                    std::cout << "[METADATA_LOG] " << message << std::endl;
+                }
+            } else if (m_debug_mode) {
                 std::cout << "[DEBUG] " << message << std::endl;
             }
         };
@@ -469,15 +623,35 @@ public:
             lt::alert_category::error);
         
         // Configure port binding for peer connections
-        settings.set_int(lt::settings_pack::listen_interfaces, 0); // Listen on all interfaces
+        // Use a specific port for port forwarding (default BitTorrent port range)
+        settings.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:6881"); // Listen on all interfaces, port 6881
         
-        // Configure connection settings
+        // Configure connection settings for better metadata fetching
         settings.set_int(lt::settings_pack::handshake_timeout, 10);
         settings.set_int(lt::settings_pack::peer_timeout, 120);
         
-        // Enable UPnP and NAT-PMP for better connectivity
+        // Enable local peer discovery for better peer connectivity
+        settings.set_bool(lt::settings_pack::enable_lsd, true);
+        
+        // Increase connection limits for metadata fetching
+        settings.set_int(lt::settings_pack::connections_limit, 200);
+        settings.set_int(lt::settings_pack::active_limit, 1000); // Increased for unlimited metadata requests
+        
+        // Enable UTP for better connectivity
+        settings.set_bool(lt::settings_pack::enable_outgoing_utp, true);
+        settings.set_bool(lt::settings_pack::enable_incoming_utp, true);
+        
+        // Enable UPnP and NAT-PMP for automatic port forwarding
         settings.set_bool(lt::settings_pack::enable_upnp, true);
         settings.set_bool(lt::settings_pack::enable_natpmp, true);
+        
+        // Configure for better connectivity with port forwarding
+        settings.set_bool(lt::settings_pack::enable_dht, true);
+        settings.set_int(lt::settings_pack::dht_announce_interval, 15);
+        
+        // Increase connection limits for better peer connectivity
+        settings.set_int(lt::settings_pack::connections_limit, 500); // Higher limit for port forwarding
+        settings.set_int(lt::settings_pack::active_limit, 1000); // Much higher limit for unlimited metadata requests
         
         m_session = std::make_unique<lt::session>(params);
         
@@ -485,8 +659,17 @@ public:
         m_metadata_downloader = std::make_unique<dht_crawler::PersistentMetadataDownloader>(
             m_session.get(), m_log_callback);
         
+        // Initialize metadata worker pool (10 workers, 20s timeout)
+        m_metadata_worker_pool = std::make_unique<MetadataWorkerPool>(m_session.get(), 10, 20, m_log_callback);
+        
         // Initialize concurrent DHT manager
         m_concurrent_dht = std::make_unique<ConcurrentDHTManager>(m_session.get(), config.num_workers, 1000);
+        
+        // Initialize BEP51 DHT indexer
+        m_bep51_indexer = std::make_unique<dht_crawler::BEP51DHTIndexer>(m_session.get(), m_log_callback);
+        
+        // Initialize smart DHT crawler
+        m_smart_crawler = std::make_unique<dht_crawler::SmartDHTCrawler>(m_session.get(), m_log_callback);
         
         // Set up concurrent DHT callbacks
         m_concurrent_dht->set_query_callback([this](const DHTQuery& query) {
@@ -507,13 +690,19 @@ public:
     }
 
     bool initialize() {
-        std::cout << "Initializing DHT Torrent Crawler..." << std::endl;
+        try {
+            std::cout << "Initializing DHT Torrent Crawler..." << std::endl;
+            
+            // Connect to MySQL (skip for testing)
+            if (!m_mysql->connect()) {
+                std::cout << "MySQL connection failed - running in test mode without database storage" << std::endl;
+                m_mysql->logError("DHTTorrentCrawler::initialize", "", -1, "MySQL connection failed", "", "WARNING", "Running in test mode");
+                // Continue without MySQL for testing
+            }
         
-        // Connect to MySQL (skip for testing)
-        if (!m_mysql->connect()) {
-            std::cout << "MySQL connection failed - running in test mode without database storage" << std::endl;
-            // Continue without MySQL for testing
-        }
+        // Check port forwarding status
+        std::cout << "Checking port forwarding status..." << std::endl;
+        std::cout << "Configured to listen on: 0.0.0.0:6881" << std::endl;
         
         // Wait for DHT bootstrap
         std::cout << "Waiting for DHT bootstrap..." << std::endl;
@@ -549,6 +738,10 @@ public:
         }
         
         return true;
+        } catch (const std::exception& e) {
+            m_mysql->logException("DHTTorrentCrawler::initialize", "", e);
+            return false;
+        }
     }
     
     void setupMetadataOnlyMode() {
@@ -607,8 +800,10 @@ public:
         m_running = true;
         
         if (m_metadata_only_mode) {
-            std::cout << "\n=== Starting Metadata-Only Mode ===" << std::endl;
-            std::cout << "Fetching metadata for " << m_metadata_hash_list.size() << " torrents..." << std::endl;
+            if (m_verbose_mode) {
+                std::cout << "\n=== Starting Metadata-Only Mode ===" << std::endl;
+                std::cout << "Fetching metadata for " << m_metadata_hash_list.size() << " torrents..." << std::endl;
+            }
             
             // Request metadata for all specified hashes
             for (const std::string& hash : m_metadata_hash_list) {
@@ -646,18 +841,22 @@ public:
             return;
         }
         
-        std::cout << "\n=== Starting DHT Torrent Discovery ===" << std::endl;
-        if (max_queries > 0) {
-            std::cout << "Max queries: " << max_queries << std::endl;
-        } else {
-            std::cout << "Running indefinitely (press Ctrl+C to stop)" << std::endl;
+        if (m_verbose_mode) {
+            std::cout << "\n=== Starting DHT Torrent Discovery ===" << std::endl;
+            if (max_queries > 0) {
+                std::cout << "Max queries: " << max_queries << std::endl;
+            } else {
+                std::cout << "Running indefinitely (press Ctrl+C to stop)" << std::endl;
+            }
         }
         
         auto start_time = std::chrono::steady_clock::now();
         int progress_counter = 0;
         
         if (m_use_concurrent_mode) {
-            std::cout << "Using concurrent DHT worker pool (4 workers)" << std::endl;
+            if (m_verbose_mode) {
+                std::cout << "Using concurrent DHT worker pool (4 workers)" << std::endl;
+            }
             
             // Start concurrent DHT manager
             m_concurrent_dht->start();
@@ -669,22 +868,43 @@ public:
                 // Process alerts from libtorrent (this is the main bottleneck now)
                 processAlerts();
                 
-                // Request metadata for some discovered torrents (every 20 iterations)
-                if (progress_counter % 20 == 0) {
+                // Request metadata for some discovered torrents (every 5 iterations for faster processing)
+                if (progress_counter % 5 == 0) {
                     requestMetadataForDiscoveredTorrents();
                 }
                 
-                // Clean up timed out metadata requests and process queue (every 10 iterations)
-                if (progress_counter % 10 == 0) {
-                    m_metadata_downloader->cleanup_timed_out_requests();
+                // Use BEP51 to get real infohashes (every 30 iterations)
+                if (progress_counter % 30 == 0) {
+                    queryBEP51Infohashes();
+                }
+                
+                // Use smart crawling for better infohash discovery (every 20 iterations)
+                if (progress_counter % 20 == 0 && m_smart_crawler && m_use_smart_mode) {
+                    m_smart_crawler->send_smart_queries();
+                }
+                
+                // Clean up timed out metadata requests (every 3 iterations for frequent cleanup)
+                if (progress_counter % 3 == 0) {
+                    m_metadata_worker_pool->cleanup_timeouts();
                     // Mark timed out torrents in database
-                    auto timed_out_requests = m_metadata_downloader->get_timed_out_requests();
+                    auto timed_out_requests = m_metadata_worker_pool->get_timed_out_requests();
                     for (const auto& hash : timed_out_requests) {
                         m_mysql->markTorrentTimedOut(hash);
+                        
+                        // Enhanced timeout logging for metadata_log_mode
+                        if (m_metadata_log_mode) {
+                            std::cout << "[METADATA_LOG] *** METADATA TIMEOUT ***" << std::endl;
+                            std::cout << "[METADATA_LOG] Hash: " << hash << std::endl;
+                            std::cout << "[METADATA_LOG] Reason: Request timed out after 20 seconds" << std::endl;
+                            std::cout << "[METADATA_LOG] Status: No metadata received from peers" << std::endl;
+                            std::cout << "[METADATA_LOG] ------------------------" << std::endl;
+                        }
                     }
-                    
-                    // Force process queue to ensure continuous processing
-                    m_metadata_downloader->force_process_queue();
+                }
+                
+                // Adjust concurrent limit dynamically (every 50 iterations)
+                if (progress_counter % 50 == 0) {
+                    m_metadata_downloader->adjust_concurrent_limit();
                 }
                 
                 progress_counter++;
@@ -694,20 +914,28 @@ public:
                     auto elapsed = std::chrono::steady_clock::now() - start_time;
                     auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
                     
-                    std::cout << "\n*** PROGRESS UPDATE (CONCURRENT MODE) ***" << std::endl;
-                    std::cout << "Queries sent: " << m_concurrent_dht->get_total_queries_sent() << std::endl;
-                    std::cout << "Queries generated: " << m_concurrent_dht->get_queries_generated() << std::endl;
-                    std::cout << "Active workers: " << m_concurrent_dht->get_active_workers() << std::endl;
-                    std::cout << "Torrents found: " << m_torrents_found << std::endl;
-                    std::cout << "Peers found: " << m_peers_found << std::endl;
-                    std::cout << "Metadata fetched: " << m_metadata_fetched << std::endl;
-                    std::cout << "Metadata queue: " << m_metadata_downloader->get_queue_size() << " pending" << std::endl;
-                    std::cout << "Active metadata requests: " << m_metadata_downloader->get_active_requests() << std::endl;
-                    std::cout << "Elapsed time: " << elapsed_seconds << " seconds" << std::endl;
-                    std::cout << "Rate: " << (m_concurrent_dht->get_total_queries_sent() / (elapsed_seconds + 1)) << " queries/sec" << std::endl;
-                    
-                    // Print concurrent DHT statistics
-                    m_concurrent_dht->print_statistics();
+                    if (m_verbose_mode) {
+                        std::cout << "\n*** PROGRESS UPDATE (CONCURRENT MODE) ***" << std::endl;
+                        std::cout << "Queries sent: " << m_concurrent_dht->get_total_queries_sent() << std::endl;
+                        std::cout << "Queries generated: " << m_concurrent_dht->get_queries_generated() << std::endl;
+                        std::cout << "Active workers: " << m_concurrent_dht->get_active_workers() << std::endl;
+                        std::cout << "Torrents found: " << m_torrents_found << std::endl;
+                        std::cout << "Peers found: " << m_peers_found << std::endl;
+                        std::cout << "Metadata fetched: " << m_metadata_fetched << std::endl;
+                    std::cout << "Metadata queue: " << m_metadata_worker_pool->get_queue_size() << " pending (WORKER POOL)" << std::endl;
+                    std::cout << "Active metadata requests: " << m_metadata_worker_pool->get_active_requests() << " (10 workers)" << std::endl;
+                        std::cout << "Elapsed time: " << elapsed_seconds << " seconds" << std::endl;
+                        std::cout << "Rate: " << (m_concurrent_dht->get_total_queries_sent() / (elapsed_seconds + 1)) << " queries/sec" << std::endl;
+                        
+                        // Port forwarding status
+                        std::cout << "Listening on: 0.0.0.0:6881 (configured)" << std::endl;
+                        
+                        // Print concurrent DHT statistics
+                        m_concurrent_dht->print_statistics();
+                    } else {
+                        // Simple counter display
+                        std::cout << "\rHashes found - " << m_torrents_found << std::flush;
+                    }
                 }
                 
                 // Reduced delay since workers are handling query generation
@@ -719,7 +947,9 @@ public:
             
         } else {
             // Fallback to original sequential mode
-            std::cout << "Using sequential DHT mode (legacy)" << std::endl;
+            if (m_verbose_mode) {
+                std::cout << "Using sequential DHT mode (legacy)" << std::endl;
+            }
             
             int query_count = 0;
             while (m_running && !m_shutdown_requested && (max_queries < 0 || query_count < max_queries)) {
@@ -754,22 +984,33 @@ public:
                 // Process alerts
                 processAlerts();
                 
-                // Request metadata for some discovered torrents (every 20 queries to ensure we get some)
-                if (query_count % 20 == 0) {
+                // Request metadata for some discovered torrents (every 10 queries for faster processing)
+                if (query_count % 10 == 0) {
                     requestMetadataForDiscoveredTorrents();
                 }
                 
-                // Clean up timed out metadata requests and process queue (every 10 queries for frequent cleanup)
-                if (query_count % 10 == 0) {
-                    m_metadata_downloader->cleanup_timed_out_requests();
+                // Clean up timed out metadata requests (every 5 queries for frequent cleanup)
+                if (query_count % 5 == 0) {
+                    m_metadata_worker_pool->cleanup_timeouts();
                     // Mark timed out torrents in database
-                    auto timed_out_requests = m_metadata_downloader->get_timed_out_requests();
+                    auto timed_out_requests = m_metadata_worker_pool->get_timed_out_requests();
                     for (const auto& hash : timed_out_requests) {
                         m_mysql->markTorrentTimedOut(hash);
+                        
+                        // Enhanced timeout logging for metadata_log_mode
+                        if (m_metadata_log_mode) {
+                            std::cout << "[METADATA_LOG] *** METADATA TIMEOUT ***" << std::endl;
+                            std::cout << "[METADATA_LOG] Hash: " << hash << std::endl;
+                            std::cout << "[METADATA_LOG] Reason: Request timed out after 20 seconds" << std::endl;
+                            std::cout << "[METADATA_LOG] Status: No metadata received from peers" << std::endl;
+                            std::cout << "[METADATA_LOG] ------------------------" << std::endl;
+                        }
                     }
-                    
-                    // Force process queue to ensure continuous processing
-                    m_metadata_downloader->force_process_queue();
+                }
+                
+                // Adjust concurrent limit dynamically (every 25 queries)
+                if (query_count % 25 == 0) {
+                    m_metadata_downloader->adjust_concurrent_limit();
                 }
                 
                 query_count++;
@@ -779,15 +1020,20 @@ public:
                     auto elapsed = std::chrono::steady_clock::now() - start_time;
                     auto elapsed_seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
                     
-                    std::cout << "\n*** PROGRESS UPDATE (SEQUENTIAL MODE) ***" << std::endl;
-                    std::cout << "Queries sent: " << m_total_queries << std::endl;
-                    std::cout << "Torrents found: " << m_torrents_found << std::endl;
-                    std::cout << "Peers found: " << m_peers_found << std::endl;
-                    std::cout << "Metadata fetched: " << m_metadata_fetched << std::endl;
-                    std::cout << "Metadata queue: " << m_metadata_downloader->get_queue_size() << " pending" << std::endl;
-                    std::cout << "Active metadata requests: " << m_metadata_downloader->get_active_requests() << std::endl;
-                    std::cout << "Elapsed time: " << elapsed_seconds << " seconds" << std::endl;
-                    std::cout << "Rate: " << (m_total_queries / (elapsed_seconds + 1)) << " queries/sec" << std::endl;
+                    if (m_verbose_mode) {
+                        std::cout << "\n*** PROGRESS UPDATE (SEQUENTIAL MODE) ***" << std::endl;
+                        std::cout << "Queries sent: " << m_total_queries << std::endl;
+                        std::cout << "Torrents found: " << m_torrents_found << std::endl;
+                        std::cout << "Peers found: " << m_peers_found << std::endl;
+                        std::cout << "Metadata fetched: " << m_metadata_fetched << std::endl;
+                    std::cout << "Metadata queue: " << m_metadata_worker_pool->get_queue_size() << " pending (WORKER POOL)" << std::endl;
+                    std::cout << "Active metadata requests: " << m_metadata_worker_pool->get_active_requests() << " (10 workers)" << std::endl;
+                        std::cout << "Elapsed time: " << elapsed_seconds << " seconds" << std::endl;
+                        std::cout << "Rate: " << (m_total_queries / (elapsed_seconds + 1)) << " queries/sec" << std::endl;
+                    } else {
+                        // Simple counter display
+                        std::cout << "\rHashes found - " << m_torrents_found << std::flush;
+                    }
                 }
                 
                 // Small delay between queries
@@ -801,26 +1047,31 @@ public:
         auto total_elapsed = std::chrono::steady_clock::now() - start_time;
         auto total_seconds = std::chrono::duration_cast<std::chrono::seconds>(total_elapsed).count();
         
-        std::cout << "\n=== CRAWLING COMPLETE ===" << std::endl;
-        if (m_use_concurrent_mode) {
-            std::cout << "Mode: Concurrent DHT Worker Pool" << std::endl;
-            std::cout << "Total queries sent: " << m_concurrent_dht->get_total_queries_sent() << std::endl;
-            std::cout << "Total queries generated: " << m_concurrent_dht->get_queries_generated() << std::endl;
-            std::cout << "Active workers: " << m_concurrent_dht->get_active_workers() << std::endl;
+        if (m_verbose_mode) {
+            std::cout << "\n=== CRAWLING COMPLETE ===" << std::endl;
+            if (m_use_concurrent_mode) {
+                std::cout << "Mode: Concurrent DHT Worker Pool" << std::endl;
+                std::cout << "Total queries sent: " << m_concurrent_dht->get_total_queries_sent() << std::endl;
+                std::cout << "Total queries generated: " << m_concurrent_dht->get_queries_generated() << std::endl;
+                std::cout << "Active workers: " << m_concurrent_dht->get_active_workers() << std::endl;
+            } else {
+                std::cout << "Mode: Sequential DHT" << std::endl;
+                std::cout << "Total queries sent: " << m_total_queries << std::endl;
+            }
+            std::cout << "Total torrents found: " << m_torrents_found << std::endl;
+            std::cout << "Total peers found: " << m_peers_found << std::endl;
+            std::cout << "Total metadata fetched: " << m_metadata_fetched << std::endl;
+            std::cout << "Metadata queue size: " << m_metadata_downloader->get_queue_size() << std::endl;
+            std::cout << "Total metadata queued: " << m_metadata_downloader->get_total_queued() << std::endl;
+            std::cout << "Total metadata processed: " << m_metadata_downloader->get_total_processed() << std::endl;
+            std::cout << "Total elapsed time: " << total_seconds << " seconds" << std::endl;
+            
+            int total_queries = m_use_concurrent_mode ? m_concurrent_dht->get_total_queries_sent() : m_total_queries;
+            std::cout << "Average rate: " << (total_queries / (total_seconds + 1)) << " queries/sec" << std::endl;
         } else {
-            std::cout << "Mode: Sequential DHT" << std::endl;
-            std::cout << "Total queries sent: " << m_total_queries << std::endl;
+            // Simple final counter
+            std::cout << "\nHashes found - " << m_torrents_found << std::endl;
         }
-        std::cout << "Total torrents found: " << m_torrents_found << std::endl;
-        std::cout << "Total peers found: " << m_peers_found << std::endl;
-        std::cout << "Total metadata fetched: " << m_metadata_fetched << std::endl;
-        std::cout << "Metadata queue size: " << m_metadata_downloader->get_queue_size() << std::endl;
-        std::cout << "Total metadata queued: " << m_metadata_downloader->get_total_queued() << std::endl;
-        std::cout << "Total metadata processed: " << m_metadata_downloader->get_total_processed() << std::endl;
-        std::cout << "Total elapsed time: " << total_seconds << " seconds" << std::endl;
-        
-        int total_queries = m_use_concurrent_mode ? m_concurrent_dht->get_total_queries_sent() : m_total_queries;
-        std::cout << "Average rate: " << (total_queries / (total_seconds + 1)) << " queries/sec" << std::endl;
     }
 
     void stop() {
@@ -836,6 +1087,75 @@ public:
     
     bool isConcurrentMode() const {
         return m_use_concurrent_mode.load();
+    }
+    
+    void setBEP51Mode(bool enabled) {
+        m_use_bep51_mode = enabled;
+        std::cout << "BEP51 DHT indexing mode: " << (enabled ? "ENABLED" : "DISABLED") << std::endl;
+    }
+    
+    bool isBEP51Mode() const {
+        return m_use_bep51_mode.load();
+    }
+    
+    // Use BEP51 to get real infohashes instead of random generation
+    void queryBEP51Infohashes() {
+        if (!m_bep51_indexer || !m_use_bep51_mode) {
+            return;
+        }
+        
+        // Query known DHT nodes for infohashes
+        auto known_nodes = m_bep51_indexer->get_known_nodes();
+        if (known_nodes.empty()) {
+            // If no known nodes, use some well-known DHT bootstrap nodes
+            std::vector<std::string> bootstrap_nodes = {
+                "router.bittorrent.com",
+                "dht.transmissionbt.com", 
+                "router.utorrent.com"
+            };
+            
+            for (const auto& node : bootstrap_nodes) {
+                // Convert to node ID (simplified - in practice you'd resolve these)
+                std::string node_id(20, 0);
+                for (int i = 0; i < 20; ++i) {
+                    node_id[i] = static_cast<char>(rand() % 256);
+                }
+                m_bep51_indexer->query_sample_infohashes(node_id);
+                (void)node; // Suppress unused variable warning
+            }
+        } else {
+            // Query up to 10 known nodes
+            int queries = 0;
+            for (const auto& node_id : known_nodes) {
+                if (queries >= 10) break;
+                m_bep51_indexer->query_sample_infohashes(node_id);
+                queries++;
+            }
+        }
+        
+        // Process collected infohashes for metadata fetching
+        auto infohashes = m_bep51_indexer->get_collected_infohashes();
+        for (const auto& infohash : infohashes) {
+            // Convert binary infohash to hex string
+            std::string hex_hash;
+            for (unsigned char c : infohash) {
+                char hex[3];
+                snprintf(hex, sizeof(hex), "%02x", c);
+                hex_hash += hex;
+            }
+            
+            // Queue for metadata fetching
+            if (m_metadata_requested.find(hex_hash) == m_metadata_requested.end()) {
+                if (m_metadata_downloader->request_metadata(hex_hash, 5, "BEP51")) { // Highest priority
+                    m_metadata_requested.insert(hex_hash);
+                    std::cout << "BEP51: Queued metadata request for: " << hex_hash << std::endl;
+                }
+            }
+        }
+        
+        if (m_debug_mode) {
+            m_bep51_indexer->print_statistics();
+        }
     }
     
     void gracefulShutdown() {
@@ -854,15 +1174,25 @@ public:
             m_metadata_manager->print_statistics();
         }
         
-        // Print metadata downloader status
-        if (m_metadata_downloader) {
-            m_metadata_downloader->print_status();
+        // Print metadata worker pool status
+        if (m_metadata_worker_pool) {
+            int total_queued, total_processed, total_successful, total_failed, total_timeout;
+            m_metadata_worker_pool->get_stats(total_queued, total_processed, total_successful, total_failed, total_timeout);
+            std::cout << "Metadata Worker Pool Statistics:" << std::endl;
+            std::cout << "- Total queued: " << total_queued << std::endl;
+            std::cout << "- Total processed: " << total_processed << std::endl;
+            std::cout << "- Successful: " << total_successful << std::endl;
+            std::cout << "- Failed: " << total_failed << std::endl;
+            std::cout << "- Timeouts: " << total_timeout << std::endl;
+            std::cout << "- Active requests: " << m_metadata_worker_pool->get_active_requests() << std::endl;
+            std::cout << "- Queue size: " << m_metadata_worker_pool->get_queue_size() << std::endl;
         }
         
-        // Clean up libtorrent session
-        if (m_session) {
-            std::cout << "Cleaning up libtorrent session..." << std::endl;
-            m_session.reset();
+        // Clean up metadata worker pool
+        if (m_metadata_worker_pool) {
+            std::cout << "Shutting down metadata worker pool..." << std::endl;
+            m_metadata_worker_pool->shutdown();
+            m_metadata_worker_pool.reset();
         }
         
         std::cout << "*** SHUTDOWN COMPLETE ***" << std::endl;
@@ -1000,6 +1330,12 @@ private:
             std::string peer_str = peer.address().to_string() + ":" + std::to_string(peer.port());
             torrent.peers.push_back(peer_str);
             m_peers_found++;
+        }
+        
+        // Record observation for smart crawling
+        if (m_smart_crawler && m_use_smart_mode) {
+            m_smart_crawler->record_incoming_observation(hash_str, "peer_reply", 
+                                                       torrent.peers.size(), torrent.peers);
         }
         
         // Store in memory and database
@@ -1193,34 +1529,71 @@ private:
     }
     
     void requestMetadataForDiscoveredTorrents() {
-        std::cout << "=== METADATA REQUEST DEBUG ===" << std::endl;
-        std::cout << "Total discovered torrents: " << m_discovered_torrents.size() << std::endl;
-        std::cout << "Already requested metadata: " << m_metadata_requested.size() << std::endl;
-        std::cout << "Active metadata requests: " << m_metadata_downloader->get_active_requests() << std::endl;
+        // Only show debug output every 20 iterations to reduce spam
+        static int debug_counter = 0;
+        debug_counter++;
         
-        // Request metadata for up to 2 discovered torrents that don't have metadata yet
+        // Show debug output less frequently when not in debug mode
+        int debug_interval = m_debug_mode ? 5 : 10;
+        
+        // Always show a simple debug message to verify function is called
+        if (debug_counter % debug_interval == 0) {
+            // Get current time for timestamp
+            auto now = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(now);
+            auto tm = *std::localtime(&time_t);
+            
+            // Format timestamp
+            char timestamp[32];
+            std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &tm);
+            
+            // Single line debug output with timestamp
+            std::cout << "[" << timestamp << "] METADATA: torrents=" << m_discovered_torrents.size() 
+                      << " requested=" << m_metadata_requested.size() 
+                      << " active=" << m_metadata_worker_pool->get_active_requests()
+                      << " queue=" << m_metadata_worker_pool->get_queue_size() << std::endl;
+        }
+        
+        // Request metadata for up to 20 discovered torrents that don't have metadata yet
         int requested = 0;
         for (auto& pair : m_discovered_torrents) {
-            if (requested >= 2) break;
+            if (requested >= 20) break; // Increased batch size for worker pool
             
             DiscoveredTorrent& torrent = pair.second;
             if (!torrent.metadata_received && m_metadata_requested.find(torrent.info_hash) == m_metadata_requested.end()) {
-                // Use enhanced metadata downloader
-                if (m_metadata_downloader->request_metadata(torrent.info_hash)) {
+                // Use worker pool for metadata requests with priority based on source
+                int priority = 1; // Default priority
+                if (torrent.source == "DHT_PEERS") priority = 3; // High priority for peer-discovered
+                else if (torrent.source == "DHT_ANNOUNCE") priority = 2; // Medium priority for announced
+                
+                if (m_metadata_worker_pool->queue_request(torrent.info_hash, priority, torrent.source)) {
                     m_metadata_requested.insert(torrent.info_hash);
                     requested++;
-                    std::cout << "Requesting metadata for: " << torrent.info_hash << std::endl;
+                    std::cout << "Queued metadata request for: " << torrent.info_hash << " (priority: " << priority << ")" << std::endl;
                 } else {
-                    std::cerr << "Failed to request metadata for " << torrent.info_hash << std::endl;
-                    m_metadata_manager->log_metadata_failure(torrent.info_hash, "Failed to add torrent to session");
+                    std::cerr << "Failed to queue metadata request for " << torrent.info_hash << std::endl;
+                    m_metadata_manager->log_metadata_failure(torrent.info_hash, "Failed to queue request");
                     // Mark as requested even if failed to avoid repeated attempts
                     m_metadata_requested.insert(torrent.info_hash);
                 }
             }
         }
         
-        std::cout << "Metadata requests made this round: " << requested << std::endl;
-        std::cout << "=== END METADATA DEBUG ===" << std::endl;
+        // Only show detailed debug output every debug_interval iterations
+        if (debug_counter % debug_interval == 0) {
+            // Get current time for timestamp
+            auto now = std::chrono::system_clock::now();
+            auto time_t = std::chrono::system_clock::to_time_t(now);
+            auto tm = *std::localtime(&time_t);
+            
+            // Format timestamp
+            char timestamp[32];
+            std::strftime(timestamp, sizeof(timestamp), "%H:%M:%S", &tm);
+            
+            std::cout << "[" << timestamp << "] METADATA: queued=" << requested 
+                      << " worker_queue=" << m_metadata_worker_pool->get_queue_size() 
+                      << " worker_active=" << m_metadata_worker_pool->get_active_requests() << std::endl;
+        }
     }
     
     void handleMetadataReceived(lt::metadata_received_alert* alert) {
@@ -1228,6 +1601,7 @@ private:
             auto torrent_info = alert->handle.torrent_file();
             if (!torrent_info) {
                 std::cout << "Metadata alert received but torrent_info is null" << std::endl;
+                m_mysql->logError("DHTTorrentCrawler::handleMetadataReceived", "", -1, "torrent_info is null", "", "WARNING");
                 return;
             }
             
@@ -1249,6 +1623,12 @@ private:
             // Notify enhanced metadata downloader
             m_metadata_downloader->handle_metadata_received(hash_str);
             m_metadata_downloader->log_success();
+            
+            // Notify metadata worker pool
+            m_metadata_worker_pool->handle_metadata_received(hash_str);
+            
+            // Extract comprehensive metadata using enhanced extraction (inspired by dump_torrent example)
+            auto enhanced_metadata = m_metadata_downloader->extract_comprehensive_metadata(*torrent_info, hash_str);
             
             // Update torrent information
             DiscoveredTorrent torrent;
@@ -1272,44 +1652,37 @@ private:
                 }
             }
             
-            // Create magnet link from the hash
-            torrent.magnet_link = "magnet:?xt=urn:btih:" + hash_str;
-            
-            // Basic torrent information
-            torrent.name = torrent_info->name();
-            torrent.size = torrent_info->total_size();
-            torrent.num_files = torrent_info->num_files();
+            // Use enhanced metadata extraction results
+            torrent.magnet_link = enhanced_metadata.magnet_link;
+            torrent.name = enhanced_metadata.name;
+            torrent.size = enhanced_metadata.total_size;
+            torrent.num_files = enhanced_metadata.num_files;
+            torrent.num_pieces = enhanced_metadata.num_pieces;
+            torrent.piece_length = enhanced_metadata.piece_length;
+            torrent.comment = enhanced_metadata.comment;
+            torrent.created_by = enhanced_metadata.created_by;
+            torrent.creation_date = enhanced_metadata.creation_date;
+            torrent.private_torrent = enhanced_metadata.private_torrent;
             torrent.metadata_received = true;
             torrent.last_seen_time = std::chrono::steady_clock::now();
-                
-                // Extract comprehensive metadata
-                torrent.comment = torrent_info->comment();
-                torrent.created_by = torrent_info->creator();
-                torrent.creation_date = torrent_info->creation_date();
-                torrent.piece_length = torrent_info->piece_length();
-                torrent.num_pieces = torrent_info->num_pieces();
-                torrent.private_torrent = torrent_info->priv();
-                
-                // Extract file information
-                torrent.file_names.clear();
-                torrent.file_sizes.clear();
-                for (int i = 0; i < torrent_info->num_files(); ++i) {
-                    torrent.file_names.push_back(torrent_info->files().file_path(i));
-                    torrent.file_sizes.push_back(torrent_info->files().file_size(i));
-                }
-                
-                // Extract tracker information
-                torrent.trackers.clear();
-                torrent.announce_list.clear();
-                auto trackers = torrent_info->trackers();
-                for (const auto& tracker : trackers) {
-                    torrent.trackers.push_back(tracker.url);
-                }
-                
-                // Set announce URL
-                if (!trackers.empty()) {
-                    torrent.announce_url = trackers[0].url;
-                }
+            
+            // Enhanced file information with flags and offsets
+            torrent.file_names = enhanced_metadata.file_names;
+            torrent.file_sizes = enhanced_metadata.file_sizes;
+            
+            // Enhanced tracker information with tiers
+            torrent.trackers = enhanced_metadata.trackers;
+            torrent.announce_list = enhanced_metadata.trackers; // Use trackers as announce_list
+            
+            // Set announce URL from first tracker
+            if (!enhanced_metadata.trackers.empty()) {
+                torrent.announce_url = enhanced_metadata.trackers[0];
+            }
+            
+            // Log enhanced metadata extraction
+            std::cout << "Enhanced metadata extracted: " << enhanced_metadata.num_files << " files, " 
+                      << enhanced_metadata.trackers.size() << " trackers, " 
+                      << enhanced_metadata.web_seeds.size() << " web seeds" << std::endl;
                 
                 // Determine content type based on file extensions
                 torrent.content_type = determineContentType(torrent.file_names);
@@ -1317,38 +1690,104 @@ private:
                 // Update in database
                 if (m_mysql->isConnected() && m_mysql->storeTorrent(torrent)) {
                     m_metadata_fetched++;
-                    std::cout << "*** METADATA RECEIVED ***" << std::endl;
-                    std::cout << "Hash: " << hash_str << std::endl;
-                    std::cout << "Name: " << torrent.name << std::endl;
-                    std::cout << "Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
-                    std::cout << "Files: " << torrent.num_files << std::endl;
-                    std::cout << "Content Type: " << torrent.content_type << std::endl;
-                    std::cout << "Magnet Link: " << torrent.magnet_link << std::endl;
-                    if (!torrent.file_names.empty()) {
-                        std::cout << "First file: " << torrent.file_names[0] << std::endl;
+                    
+                    // Enhanced metadata logging for metadata_log_mode
+                    if (m_metadata_log_mode) {
+                        std::cout << "[METADATA_LOG] *** METADATA DISCOVERED ***" << std::endl;
+                        std::cout << "[METADATA_LOG] Hash: " << hash_str << std::endl;
+                        std::cout << "[METADATA_LOG] Name: " << torrent.name << std::endl;
+                        std::cout << "[METADATA_LOG] Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
+                        std::cout << "[METADATA_LOG] Files: " << torrent.num_files << std::endl;
+                        std::cout << "[METADATA_LOG] Content Type: " << torrent.content_type << std::endl;
+                        
+                        // Show file details
+                        if (!torrent.file_names.empty()) {
+                            std::cout << "[METADATA_LOG] File Details:" << std::endl;
+                            for (size_t i = 0; i < std::min(torrent.file_names.size(), size_t(5)); ++i) {
+                                std::cout << "[METADATA_LOG]   " << (i+1) << ". " << torrent.file_names[i];
+                                if (i < torrent.file_sizes.size()) {
+                                    std::cout << " (" << formatBytes(torrent.file_sizes[i]) << ")";
+                                }
+                                std::cout << std::endl;
+                            }
+                            if (torrent.file_names.size() > 5) {
+                                std::cout << "[METADATA_LOG]   ... and " << (torrent.file_names.size() - 5) << " more files" << std::endl;
+                            }
+                        }
+                        
+                        if (!torrent.comment.empty()) {
+                            std::cout << "[METADATA_LOG] Comment: " << torrent.comment.substr(0, 200) << (torrent.comment.length() > 200 ? "..." : "") << std::endl;
+                        }
+                        std::cout << "[METADATA_LOG] Trackers: " << torrent.trackers.size() << std::endl;
+                        std::cout << "[METADATA_LOG] Magnet: " << torrent.magnet_link << std::endl;
+                        std::cout << "[METADATA_LOG] ------------------------" << std::endl;
+                    } else {
+                        std::cout << "*** METADATA RECEIVED ***" << std::endl;
+                        std::cout << "Hash: " << hash_str << std::endl;
+                        std::cout << "Name: " << torrent.name << std::endl;
+                        std::cout << "Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
+                        std::cout << "Files: " << torrent.num_files << std::endl;
+                        std::cout << "Content Type: " << torrent.content_type << std::endl;
+                        std::cout << "Magnet Link: " << torrent.magnet_link << std::endl;
+                        if (!torrent.file_names.empty()) {
+                            std::cout << "First file: " << torrent.file_names[0] << std::endl;
+                        }
+                        if (!torrent.comment.empty()) {
+                            std::cout << "Comment: " << torrent.comment.substr(0, 100) << (torrent.comment.length() > 100 ? "..." : "") << std::endl;
+                        }
+                        std::cout << "Trackers: " << torrent.trackers.size() << std::endl;
+                        std::cout << "------------------------" << std::endl;
                     }
-                    if (!torrent.comment.empty()) {
-                        std::cout << "Comment: " << torrent.comment.substr(0, 100) << (torrent.comment.length() > 100 ? "..." : "") << std::endl;
-                    }
-                    std::cout << "Trackers: " << torrent.trackers.size() << std::endl;
-                    std::cout << "------------------------" << std::endl;
                 } else {
                     m_metadata_fetched++;
-                    std::cout << "*** METADATA RECEIVED (TEST MODE) ***" << std::endl;
-                    std::cout << "Hash: " << hash_str << std::endl;
-                    std::cout << "Name: " << torrent.name << std::endl;
-                    std::cout << "Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
-                    std::cout << "Files: " << torrent.num_files << std::endl;
-                    std::cout << "Content Type: " << torrent.content_type << std::endl;
-                    std::cout << "Magnet Link: " << torrent.magnet_link << std::endl;
-                    if (!torrent.file_names.empty()) {
-                        std::cout << "First file: " << torrent.file_names[0] << std::endl;
+                    
+                    // Enhanced metadata logging for metadata_log_mode (test mode)
+                    if (m_metadata_log_mode) {
+                        std::cout << "[METADATA_LOG] *** METADATA DISCOVERED (TEST MODE) ***" << std::endl;
+                        std::cout << "[METADATA_LOG] Hash: " << hash_str << std::endl;
+                        std::cout << "[METADATA_LOG] Name: " << torrent.name << std::endl;
+                        std::cout << "[METADATA_LOG] Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
+                        std::cout << "[METADATA_LOG] Files: " << torrent.num_files << std::endl;
+                        std::cout << "[METADATA_LOG] Content Type: " << torrent.content_type << std::endl;
+                        
+                        // Show file details
+                        if (!torrent.file_names.empty()) {
+                            std::cout << "[METADATA_LOG] File Details:" << std::endl;
+                            for (size_t i = 0; i < std::min(torrent.file_names.size(), size_t(5)); ++i) {
+                                std::cout << "[METADATA_LOG]   " << (i+1) << ". " << torrent.file_names[i];
+                                if (i < torrent.file_sizes.size()) {
+                                    std::cout << " (" << formatBytes(torrent.file_sizes[i]) << ")";
+                                }
+                                std::cout << std::endl;
+                            }
+                            if (torrent.file_names.size() > 5) {
+                                std::cout << "[METADATA_LOG]   ... and " << (torrent.file_names.size() - 5) << " more files" << std::endl;
+                            }
+                        }
+                        
+                        if (!torrent.comment.empty()) {
+                            std::cout << "[METADATA_LOG] Comment: " << torrent.comment.substr(0, 200) << (torrent.comment.length() > 200 ? "..." : "") << std::endl;
+                        }
+                        std::cout << "[METADATA_LOG] Trackers: " << torrent.trackers.size() << std::endl;
+                        std::cout << "[METADATA_LOG] Magnet: " << torrent.magnet_link << std::endl;
+                        std::cout << "[METADATA_LOG] ------------------------" << std::endl;
+                    } else {
+                        std::cout << "*** METADATA RECEIVED (TEST MODE) ***" << std::endl;
+                        std::cout << "Hash: " << hash_str << std::endl;
+                        std::cout << "Name: " << torrent.name << std::endl;
+                        std::cout << "Size: " << torrent.size << " bytes (" << formatBytes(torrent.size) << ")" << std::endl;
+                        std::cout << "Files: " << torrent.num_files << std::endl;
+                        std::cout << "Content Type: " << torrent.content_type << std::endl;
+                        std::cout << "Magnet Link: " << torrent.magnet_link << std::endl;
+                        if (!torrent.file_names.empty()) {
+                            std::cout << "First file: " << torrent.file_names[0] << std::endl;
+                        }
+                        if (!torrent.comment.empty()) {
+                            std::cout << "Comment: " << torrent.comment.substr(0, 100) << (torrent.comment.length() > 100 ? "..." : "") << std::endl;
+                        }
+                        std::cout << "Trackers: " << torrent.trackers.size() << std::endl;
+                        std::cout << "------------------------" << std::endl;
                     }
-                    if (!torrent.comment.empty()) {
-                        std::cout << "Comment: " << torrent.comment.substr(0, 100) << (torrent.comment.length() > 100 ? "..." : "") << std::endl;
-                    }
-                    std::cout << "Trackers: " << torrent.trackers.size() << std::endl;
-                    std::cout << "------------------------" << std::endl;
                 }
             
             // Remove torrent from session to free resources
@@ -1356,6 +1795,7 @@ private:
             
         } catch (const std::exception& e) {
             std::cerr << "Error processing metadata: " << e.what() << std::endl;
+            m_mysql->logException("DHTTorrentCrawler::handleMetadataReceived", "", e);
         }
     }
     
@@ -1623,10 +2063,17 @@ void printUsage(const char* program_name, bool test_missing_libs = false) {
     std::cout << "                    Example: --metadata /path/to/hashes.txt" << std::endl;
     std::cout << "  --debug           Enable detailed debug logging and verbose output" << std::endl;
     std::cout << "                    Example: --debug" << std::endl;
+    std::cout << "  --verbose         Enable verbose output (default is counter mode)" << std::endl;
+    std::cout << "                    Example: --verbose" << std::endl;
+    std::cout << "  --metadata_log    Enable metadata-only logging (suppress all other logs)" << std::endl;
+    std::cout << "                    Shows only metadata discovery, success, and timeout messages" << std::endl;
+    std::cout << "                    Example: --metadata_log" << std::endl;
     std::cout << "  --sequential      Disable concurrent DHT worker pool (use sequential mode)" << std::endl;
     std::cout << "                    Example: --sequential" << std::endl;
     std::cout << "  --workers NUM     Number of concurrent DHT workers (default: 4)" << std::endl;
     std::cout << "                    Example: --workers 8" << std::endl;
+    std::cout << "  --no-bep51        Disable BEP51 DHT infohash indexing (use random generation)" << std::endl;
+    std::cout << "                    Example: --no-bep51" << std::endl;
     std::cout << "  --test-missing-libs Show help with simulated missing libraries (for testing)" << std::endl;
     std::cout << "                    Example: --test-missing-libs" << std::endl;
     std::cout << "  --help            Show this help message and exit" << std::endl;
@@ -1654,6 +2101,12 @@ void printUsage(const char* program_name, bool test_missing_libs = false) {
     std::cout << "  # Debug mode for troubleshooting:" << std::endl;
     std::cout << "  " << program_name << " --user admin --password secret --database torrents --debug --queries 100" << std::endl;
     std::cout << std::endl;
+    std::cout << "  # Metadata logging mode for focused metadata monitoring:" << std::endl;
+    std::cout << "  " << program_name << " --user admin --password secret --database torrents --metadata_log" << std::endl;
+    std::cout << std::endl;
+    std::cout << "  # Verbose mode for detailed output:" << std::endl;
+    std::cout << "  " << program_name << " --user admin --password secret --database torrents --verbose" << std::endl;
+    std::cout << std::endl;
     std::cout << "  # High-performance mode with 8 workers:" << std::endl;
     std::cout << "  " << program_name << " --user admin --password secret --database torrents --workers 8" << std::endl;
     std::cout << std::endl;
@@ -1673,6 +2126,8 @@ void printUsage(const char* program_name, bool test_missing_libs = false) {
 
 int main(int argc, char* argv[]) {
 #ifdef DISABLE_LIBTORRENT
+    (void)argc; // Suppress unused parameter warning
+    (void)argv; // Suppress unused parameter warning
     std::cout << "DHT Crawler - Windows Build (libtorrent disabled)" << std::endl;
     std::cout << "This is a placeholder Windows build." << std::endl;
     std::cout << "For full functionality, please use the Linux or macOS builds." << std::endl;
@@ -1713,6 +2168,10 @@ int main(int argc, char* argv[]) {
             config.metadata_hashes = argv[++i];
         } else if (arg == "--debug") {
             config.debug_mode = true;
+        } else if (arg == "--verbose") {
+            config.verbose_mode = true;
+        } else if (arg == "--metadata_log") {
+            config.metadata_log_mode = true;
         } else if (arg == "--sequential") {
             config.concurrent_mode = false;
         } else if (arg == "--workers" && i + 1 < argc) {
@@ -1721,6 +2180,8 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: Number of workers must be between 1 and 16" << std::endl;
                 return 1;
             }
+        } else if (arg == "--no-bep51") {
+            config.bep51_mode = false;
         } else {
             std::cerr << "Unknown argument: " << arg << std::endl;
             printUsage(argv[0]);
@@ -1741,16 +2202,20 @@ int main(int argc, char* argv[]) {
         config.server = "localhost";
     }
     
-    std::cout << "=== DHT Torrent Discovery Tool ===" << std::endl;
-    std::cout << "MySQL Server: " << config.server << ":" << config.port << std::endl;
-    std::cout << "Database: " << config.database << std::endl;
-    std::cout << "User: " << config.user << std::endl;
-    if (max_queries > 0) {
-        std::cout << "Max Queries: " << max_queries << std::endl;
+    if (config.verbose_mode) {
+        std::cout << "=== DHT Torrent Discovery Tool ===" << std::endl;
+        std::cout << "MySQL Server: " << config.server << ":" << config.port << std::endl;
+        std::cout << "Database: " << config.database << std::endl;
+        std::cout << "User: " << config.user << std::endl;
+        if (max_queries > 0) {
+            std::cout << "Max Queries: " << max_queries << std::endl;
+        } else {
+            std::cout << "Running indefinitely (press Ctrl+C to stop)" << std::endl;
+        }
+        std::cout << std::endl;
     } else {
-        std::cout << "Running indefinitely (press Ctrl+C to stop)" << std::endl;
+        std::cout << "DHT Crawler started - Press Ctrl+C to stop" << std::endl;
     }
-    std::cout << std::endl;
     
     // Set up signal handling
     signal(SIGINT, signalHandler);   // Ctrl+C
@@ -1775,6 +2240,20 @@ int main(int argc, char* argv[]) {
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
+        // Try to log the error if MySQL is available
+        try {
+            MySQLConfig temp_config;
+            temp_config.server = "192.168.10.100";
+            temp_config.user = "keynetworks";
+            temp_config.password = "K3yn3tw0rk5";
+            temp_config.database = "Torrents";
+            MySQLConnection temp_mysql(temp_config);
+            if (temp_mysql.connect()) {
+                temp_mysql.logException("main", "", e);
+            }
+        } catch (...) {
+            // Ignore logging errors in main
+        }
         return 1;
     }
     

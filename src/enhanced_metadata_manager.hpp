@@ -359,8 +359,8 @@ public:
                                 std::function<void(const std::string&)> log_callback = nullptr)
         : m_session(session)
         , m_log_callback(log_callback)
-        , m_max_concurrent_requests(50) // Reasonable concurrent limit for libtorrent
-        , m_request_timeout_seconds(120) // 2 minutes timeout
+        , m_max_concurrent_requests(1000) // Match libtorrent active_limit
+        , m_request_timeout_seconds(20) // Reduced timeout for faster cleanup
         , m_success_count(0)
         , m_failure_count(0)
         , m_timeout_count(0)
@@ -382,12 +382,14 @@ public:
             return true; // Consider this a success since it's already being handled
         }
 
-        // Add to unlimited queue
+        // Add to unlimited queue - this should ALWAYS succeed
         m_queue.enqueue(info_hash, priority, source);
         m_total_queued++;
         
         log("Queued metadata request for: " + info_hash.substr(0, 8) + "... (priority: " + std::to_string(priority) + 
-            ", source: " + source + ", queue size: " + std::to_string(m_queue.size()) + ")");
+            ", source: " + source + ", queue size: " + std::to_string(m_queue.size()) + 
+            ", active: " + std::to_string(m_active_tracker.get_active_requests()) + 
+            ", max: " + std::to_string(m_max_concurrent_requests) + ")");
         
         // Try to process the queue immediately
         process_queue();
@@ -395,9 +397,15 @@ public:
         return true; // Always succeeds - hash is now queued
     }
 
-    // Process items from the queue into active requests
+    // Process items from the queue into active requests - UNLIMITED QUEUE VERSION
     void process_queue() {
-        while (!m_queue.is_empty() && m_active_tracker.get_active_requests() < static_cast<size_t>(m_max_concurrent_requests)) {
+        int processed_this_round = 0;
+        const int max_per_round = 50; // Process more requests per round for unlimited queue
+        
+        // Process as many requests as possible up to the concurrent limit
+        while (!m_queue.is_empty() && 
+               m_active_tracker.get_active_requests() < static_cast<size_t>(m_max_concurrent_requests) &&
+               processed_this_round < max_per_round) {
             std::string hash;
             int priority;
             std::string source;
@@ -408,11 +416,22 @@ public:
             
             if (process_single_request(hash, priority, source)) {
                 m_total_processed++;
+                processed_this_round++;
             } else {
-                // If processing failed, we could re-queue with lower priority or skip
-                // For now, we'll skip failed requests to avoid infinite loops
-                log("Failed to process queued request for: " + hash.substr(0, 8) + "... (skipping)");
+                // Re-queue with lower priority instead of skipping
+                if (priority > 1) {
+                    m_queue.enqueue(hash, priority - 1, source + "_RETRY");
+                    log("Re-queued failed request with lower priority: " + hash.substr(0, 8) + "...");
+                } else {
+                    log("Failed to process queued request for: " + hash.substr(0, 8) + "... (final attempt)");
+                    m_failure_count++;
+                }
             }
+        }
+        
+        if (processed_this_round > 0) {
+            log("Processed " + std::to_string(processed_this_round) + " requests this round (queue: " + 
+                std::to_string(m_queue.size()) + ", active: " + std::to_string(m_active_tracker.get_active_requests()) + ")");
         }
     }
 
@@ -443,7 +462,10 @@ public:
             params.save_path = ".";  // Current directory
             params.flags |= lt::torrent_flags::auto_managed;
             params.flags |= lt::torrent_flags::duplicate_is_error;
-            params.flags |= lt::torrent_flags::upload_mode;  // Don't upload, just download metadata
+            
+            // FIXED: Don't use upload_mode as it prevents metadata downloading
+            // Instead, use seed_mode which allows metadata download but no data upload
+            params.flags |= lt::torrent_flags::seed_mode;  // Allow metadata download, no data upload
             
             // Add torrent to session
             auto handle = m_session->add_torrent(params);
@@ -472,22 +494,138 @@ public:
         process_queue();
     }
 
+    // Enhanced metadata extraction using libtorrent dump_torrent techniques
+    struct EnhancedTorrentMetadata {
+        std::string info_hash;
+        std::string name;
+        size_t total_size;
+        int num_files;
+        int num_pieces;
+        int piece_length;
+        std::string comment;
+        std::string created_by;
+        std::time_t creation_date;
+        std::string magnet_link;
+        std::vector<std::string> trackers;
+        std::vector<int> tracker_tiers;
+        std::vector<std::string> file_names;
+        std::vector<size_t> file_sizes;
+        std::vector<size_t> file_offsets;
+        std::vector<std::string> file_flags; // executable, hidden, symlink, pad
+        std::vector<std::string> web_seeds;
+        bool private_torrent;
+        std::string encoding;
+    };
+
+    // Extract comprehensive metadata from torrent_info (inspired by dump_torrent example)
+    EnhancedTorrentMetadata extract_comprehensive_metadata(const lt::torrent_info& ti, const std::string& info_hash) {
+        EnhancedTorrentMetadata metadata;
+        metadata.info_hash = info_hash;
+        
+        try {
+            // Basic torrent information
+            metadata.name = ti.name();
+            metadata.total_size = ti.total_size();
+            metadata.num_files = ti.num_files();
+            metadata.num_pieces = ti.num_pieces();
+            metadata.piece_length = ti.piece_length();
+            metadata.comment = ti.comment();
+            metadata.created_by = ti.creator();
+            metadata.creation_date = ti.creation_date();
+            metadata.private_torrent = ti.priv();
+            
+            // Generate magnet link using libtorrent's make_magnet_uri
+            metadata.magnet_link = lt::make_magnet_uri(ti);
+            
+            // Extract tracker information
+            const auto& trackers = ti.trackers();
+            
+            metadata.trackers.reserve(trackers.size());
+            metadata.tracker_tiers.reserve(trackers.size());
+            
+            for (size_t i = 0; i < trackers.size(); ++i) {
+                metadata.trackers.push_back(trackers[i].url);
+                metadata.tracker_tiers.push_back(0); // Default tier (tracker_tiers() not available in libtorrent 2.0)
+            }
+            
+            // Extract detailed file information (inspired by dump_torrent file listing)
+            const lt::file_storage& fs = ti.files();
+            metadata.file_names.reserve(fs.num_files());
+            metadata.file_sizes.reserve(fs.num_files());
+            metadata.file_offsets.reserve(fs.num_files());
+            metadata.file_flags.reserve(fs.num_files());
+            
+            for (auto i : fs.file_range()) {
+                metadata.file_names.push_back(fs.file_path(i));
+                metadata.file_sizes.push_back(fs.file_size(i));
+                metadata.file_offsets.push_back(fs.file_offset(i));
+                
+                // Extract file flags
+                auto flags = fs.file_flags(i);
+                std::string flag_str = "";
+                if (flags & lt::file_storage::flag_pad_file) flag_str += "pad,";
+                if (flags & lt::file_storage::flag_executable) flag_str += "exec,";
+                if (flags & lt::file_storage::flag_hidden) flag_str += "hidden,";
+                if (flags & lt::file_storage::flag_symlink) flag_str += "symlink,";
+                
+                if (!flag_str.empty()) {
+                    flag_str.pop_back(); // Remove trailing comma
+                }
+                metadata.file_flags.push_back(flag_str);
+            }
+            
+            // Extract web seeds
+            const auto& url_seeds = ti.web_seeds();
+            metadata.web_seeds.reserve(url_seeds.size());
+            for (const auto& seed : url_seeds) {
+                metadata.web_seeds.push_back(seed.url);
+            }
+            
+            log("Extracted comprehensive metadata for " + info_hash.substr(0, 8) + "...: " +
+                std::to_string(metadata.num_files) + " files, " + 
+                std::to_string(metadata.trackers.size()) + " trackers, " +
+                std::to_string(metadata.web_seeds.size()) + " web seeds");
+                
+        } catch (const std::exception& e) {
+            log("Error extracting metadata for " + info_hash.substr(0, 8) + "...: " + e.what());
+        }
+        
+        return metadata;
+    }
+
+    // Store metadata callback for external handling
+    std::function<void(const EnhancedTorrentMetadata&)> m_metadata_callback;
+    
+    void set_metadata_callback(std::function<void(const EnhancedTorrentMetadata&)> callback) {
+        m_metadata_callback = callback;
+    }
+
     void cleanup_timed_out_requests() {
         auto timed_out = m_active_tracker.get_timed_out_requests(m_request_timeout_seconds);
+        int cleaned_count = 0;
+        
         for (const auto& hash : timed_out) {
             // Remove the torrent from libtorrent session
             auto it = m_active_tracker.get_requests().find(hash);
             if (it != m_active_tracker.get_requests().end() && it->second.handle.is_valid()) {
-                m_session->remove_torrent(it->second.handle);
+                try {
+                    m_session->remove_torrent(it->second.handle);
+                } catch (const std::exception& e) {
+                    log("Error removing timed out torrent: " + std::string(e.what()));
+                }
             }
             
             m_active_tracker.remove_request(hash);
             m_timeout_count++;
-            log("Removed timed out metadata request for: " + hash.substr(0, 8) + "... (timeouts: " + std::to_string(m_timeout_count) + ")");
+            cleaned_count++;
         }
         
-        // Process more items from the queue after cleanup
-        process_queue();
+        if (cleaned_count > 0) {
+            log("Cleaned up " + std::to_string(cleaned_count) + " timed out requests (total timeouts: " + std::to_string(m_timeout_count) + ")");
+            
+            // Process more items from the queue after cleanup
+            process_queue();
+        }
     }
 
     void log_success() {
@@ -512,14 +650,36 @@ public:
 
     void set_max_concurrent_requests(int max) {
         m_max_concurrent_requests = max;
+        log("Set max concurrent requests to: " + std::to_string(max));
     }
 
     void set_request_timeout(int timeout_seconds) {
         m_request_timeout_seconds = timeout_seconds;
+        log("Set request timeout to: " + std::to_string(timeout_seconds) + " seconds");
+    }
+    
+    // Dynamically adjust concurrent limit based on performance
+    void adjust_concurrent_limit() {
+        // If we have a large queue and low timeout rate, increase the limit
+        if (m_queue.size() > 2000 && m_timeout_count < m_success_count / 10) {
+            if (m_max_concurrent_requests < 1000) {
+                m_max_concurrent_requests = std::min(1000, m_max_concurrent_requests + 100);
+                log("Increased concurrent limit to: " + std::to_string(m_max_concurrent_requests) + " (queue size: " + std::to_string(m_queue.size()) + ")");
+            }
+        }
+        // If we have high timeout rate, decrease the limit
+        else if (m_timeout_count > m_success_count / 5 && m_max_concurrent_requests > 200) {
+            m_max_concurrent_requests = std::max(200, m_max_concurrent_requests - 50);
+            log("Decreased concurrent limit to: " + std::to_string(m_max_concurrent_requests) + " (high timeout rate)");
+        }
     }
 
     size_t get_active_requests() const {
         return m_active_tracker.get_active_requests();
+    }
+    
+    int get_max_concurrent_requests() const {
+        return m_max_concurrent_requests;
     }
 
     size_t get_queue_size() const {

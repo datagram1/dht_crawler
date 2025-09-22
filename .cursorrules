@@ -1,0 +1,25 @@
+# Cursor Rules for DHT Crawler Project
+
+## Database Configuration
+- **Database Type**: MySQL
+- **Host**: 192.168.10.100
+- **Username**: keynetworks
+- **Password**: K3yn3tw0rk5
+- **Database Name**: Torrents
+- **Default Database**: Torrents
+
+## Project Context
+This is a DHT (Distributed Hash Table) crawler project that connects to a MySQL database to store torrent metadata and information.
+
+## Database Connection Details
+When working with database-related code, use these connection parameters:
+- Host: 192.168.10.100
+- Port: 3306 (default MySQL port)
+- Database: Torrents
+- User: keynetworks
+- Password: K3yn3tw0rk5
+
+## Code Guidelines
+- Always use the specified database connection details when suggesting database code
+- Consider the MySQL database schema when writing queries or suggesting database operations
+- The project appears to be focused on torrent discovery and metadata management
