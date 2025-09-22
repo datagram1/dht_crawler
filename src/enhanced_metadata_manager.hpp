@@ -39,7 +39,7 @@
 namespace dht_crawler {
 
 // Utility function to convert hash formats
-std::string convert_hash_to_hex(const std::string& hash) {
+inline std::string convert_hash_to_hex(const std::string& hash) {
     // If it's already hex (40 characters), return as is
     if (hash.length() == 40) {
         // Check if it's valid hex

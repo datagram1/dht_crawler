@@ -45,6 +45,27 @@
 #include "smart_dht_crawler.hpp"
 #include "metadata_worker_pool.hpp"
 
+// New enhanced components from magnetico upgrade - temporarily disabled for initial build
+// #include "metadata_validator.hpp"
+// #include "timeout_manager.hpp"
+// #include "error_handler.hpp"
+// #include "database_manager.hpp"  // Temporarily disabled due to MySQL include issues
+// #include "dht_token_manager.hpp"
+// #include "request_cache_manager.hpp"
+// #include "node_quality_tracker.hpp"
+// #include "extension_protocol_diagnostics.hpp"
+// #include "bep9_issue_resolver.hpp"
+// #include "direct_peer_connector.hpp"
+// #include "bittorrent_protocol.hpp"
+// #include "ut_metadata_protocol.hpp"
+// #include "hybrid_connection_manager.hpp"
+// #include "enhanced_bootstrap.hpp"
+// #include "routing_table_manager.hpp"
+// #include "metadata_piece_manager.hpp"
+// #include "performance_monitor.hpp"
+// #include "performance_config.hpp"
+// #include "performance_optimizer.hpp"
+
 // Forward declarations
 std::string determineContentType(const std::vector<std::string>& file_names);
 std::string formatBytes(size_t bytes);
@@ -691,6 +712,26 @@ private:
     // Smart DHT Crawling (rate-limited, observation-based)
     std::unique_ptr<dht_crawler::SmartDHTCrawler> m_smart_crawler;
     std::atomic<bool> m_use_smart_mode;
+    
+    // Enhanced components from magnetico upgrade - temporarily disabled
+    // std::unique_ptr<MetadataValidator> m_metadata_validator;
+    // std::unique_ptr<TimeoutManager> m_timeout_manager;
+    // std::unique_ptr<ErrorHandler> m_error_handler;
+    // std::unique_ptr<DatabaseManager> m_database_manager;  // Temporarily disabled
+    // std::unique_ptr<DHTTokenManager> m_dht_token_manager;
+    // std::unique_ptr<RequestCacheManager> m_request_cache_manager;
+    // std::unique_ptr<NodeQualityTracker> m_node_quality_tracker;
+    // std::unique_ptr<ExtensionProtocolDiagnostics> m_extension_protocol_diagnostics;
+    // std::unique_ptr<BEP9IssueResolver> m_bep9_issue_resolver;
+    // std::unique_ptr<DirectPeerConnector> m_direct_peer_connector;
+    // std::unique_ptr<BitTorrentProtocol> m_bittorrent_protocol;
+    // std::unique_ptr<UTMetadataProtocol> m_ut_metadata_protocol;
+    // std::unique_ptr<HybridConnectionManager> m_hybrid_connection_manager;
+    // std::unique_ptr<EnhancedBootstrap> m_enhanced_bootstrap;
+    // std::unique_ptr<RoutingTableManager> m_routing_table_manager;
+    // std::unique_ptr<MetadataPieceManager> m_metadata_piece_manager;
+    // std::unique_ptr<PerformanceMonitor> m_performance_monitor;
+    // std::unique_ptr<dht_crawler::PerformanceOptimizer> m_performance_optimizer;
 
 public:
     DHTTorrentCrawler(const MySQLConfig& config) 
@@ -796,6 +837,26 @@ public:
         
         // Initialize smart DHT crawler
         m_smart_crawler = std::make_unique<dht_crawler::SmartDHTCrawler>(m_session.get(), m_log_callback);
+        
+        // Initialize enhanced components from magnetico upgrade - temporarily disabled
+        // m_metadata_validator = std::make_unique<MetadataValidator>();
+        // m_timeout_manager = std::make_unique<TimeoutManager>();
+        // m_error_handler = std::make_unique<ErrorHandler>();
+        // m_database_manager = std::make_unique<DatabaseManager>(config);  // Temporarily disabled
+        // m_dht_token_manager = std::make_unique<DHTTokenManager>();
+        // m_request_cache_manager = std::make_unique<RequestCacheManager>();
+        // m_node_quality_tracker = std::make_unique<NodeQualityTracker>();
+        // m_extension_protocol_diagnostics = std::make_unique<ExtensionProtocolDiagnostics>();
+        // m_bep9_issue_resolver = std::make_unique<BEP9IssueResolver>();
+        // m_direct_peer_connector = std::make_unique<DirectPeerConnector>();
+        // m_bittorrent_protocol = std::make_unique<BitTorrentProtocol>();
+        // m_ut_metadata_protocol = std::make_unique<UTMetadataProtocol>();
+        // m_hybrid_connection_manager = std::make_unique<HybridConnectionManager>();
+        // m_enhanced_bootstrap = std::make_unique<EnhancedBootstrap>();
+        // m_routing_table_manager = std::make_unique<RoutingTableManager>();
+        // m_metadata_piece_manager = std::make_unique<MetadataPieceManager>();
+        // m_performance_monitor = std::make_unique<PerformanceMonitor>();
+        // m_performance_optimizer = std::make_unique<dht_crawler::PerformanceOptimizer>();
         
         // Set up concurrent DHT callbacks
         m_concurrent_dht->set_query_callback([this](const DHTQuery& query) {

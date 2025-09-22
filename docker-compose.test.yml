@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # MySQL database for testing
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: Torrents
+      MYSQL_USER: keynetworks
+      MYSQL_PASSWORD: K3yn3tw0rk5
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "keynetworks", "-pK3yn3tw0rk5"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # DHT Crawler application
+  dht_crawler:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: keynetworks
+      DB_PASSWORD: K3yn3tw0rk5
+      DB_NAME: Torrents
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    command: ["./build/dht_crawler", "--server", "mysql", "--user", "keynetworks", "--password", "K3yn3tw0rk5", "--database", "Torrents", "--verbose"]
+
+  # Performance testing
+  performance_test:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: keynetworks
+      DB_PASSWORD: K3yn3tw0rk5
+      DB_NAME: Torrents
+    volumes:
+      - ./tests:/app/tests
+    command: ["./build/performance_tests"]
+
+  # Database migration testing
+  migration_test:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: keynetworks
+      DB_PASSWORD: K3yn3tw0rk5
+      DB_NAME: Torrents
+    volumes:
+      - ./database/migrations:/app/database/migrations
+    command: ["bash", "-c", "cd database/migrations && ./run_migrations.sh --all"]
+
+volumes:
+  mysql_data:

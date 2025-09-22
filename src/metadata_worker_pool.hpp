@@ -393,9 +393,7 @@ public:
     
     void cleanup_timeouts() {}
     
-    std::string convert_hash_to_hex(const std::string& hash) {
-        return hash;
-    }
+    // convert_hash_to_hex function removed - using the one from enhanced_metadata_manager.hpp
     
     void log(const std::string& message) {
         (void)message; // Suppress unused parameter warning

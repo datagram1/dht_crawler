@@ -1,0 +1,59 @@
+# CI/CD Dockerfile for DHT Crawler
+FROM ubuntu:22.04
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CMAKE_BUILD_TYPE=Release
+ENV CC=gcc
+ENV CXX=g++
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    pkg-config \
+    libboost-all-dev \
+    libmysqlclient-dev \
+    libssl-dev \
+    libcurl4-openssl-dev \
+    clang-format \
+    clang-tidy \
+    cppcheck \
+    valgrind \
+    gdb \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create working directory
+WORKDIR /app
+
+# Copy source code
+COPY . .
+
+# Create build directory
+RUN mkdir -p build
+
+# Configure CMake
+RUN cmake -B build -S . \
+    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+    -DENABLE_TESTING=ON \
+    -DENABLE_COVERAGE=ON
+
+# Build the project
+RUN cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
+
+# Run tests
+RUN ctest --test-dir build --output-on-failure
+
+# Run code quality checks
+RUN find src tests -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run --Werror
+RUN cppcheck --enable=all --error-exitcode=1 --suppress=missingIncludeSystem src/
+RUN find src -name "*.cpp" | xargs clang-tidy -p build/
+
+# Generate coverage report
+RUN if [ -f build/coverage.info ]; then \
+        genhtml build/coverage.info -o build/coverage-report; \
+    fi
+
+# Set default command
+CMD ["/app/build/dht_crawler", "--help"]

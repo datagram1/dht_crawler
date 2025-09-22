@@ -1,0 +1,270 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  release:
+    types: [ published ]
+
+env:
+  BUILD_TYPE: Release
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  # Build and test on multiple platforms
+  build-and-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        compiler: [gcc, clang, msvc]
+        exclude:
+          - os: windows-latest
+            compiler: gcc
+          - os: windows-latest
+            compiler: clang
+          - os: ubuntu-latest
+            compiler: msvc
+          - os: macos-latest
+            compiler: msvc
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Set up build environment
+      run: |
+        if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libboost-all-dev libmysqlclient-dev
+        elif [ "${{ matrix.os }}" = "macos-latest" ]; then
+          brew install cmake boost mysql
+        elif [ "${{ matrix.os }}" = "windows-latest" ]; then
+          # Windows setup handled by vcpkg
+          echo "Windows setup"
+        fi
+
+    - name: Configure CMake
+      run: |
+        cmake -B build -S . \
+          -DCMAKE_BUILD_TYPE=${{ env.CMAKE_BUILD_TYPE }} \
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++' || matrix.compiler == 'clang' && 'clang++' || 'cl' }} \
+          -DENABLE_TESTING=ON
+
+    - name: Build
+      run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+    - name: Test
+      run: |
+        if [ "${{ matrix.os }}" = "windows-latest" ]; then
+          ctest --test-dir build --build-config ${{ env.BUILD_TYPE }} --output-on-failure
+        else
+          ctest --test-dir build --output-on-failure
+        fi
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.compiler }}
+        path: build/test-results/
+
+  # Code quality checks
+  code-quality:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up clang-format
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format
+
+    - name: Check code formatting
+      run: |
+        find src tests -name "*.cpp" -o -name "*.hpp" | xargs clang-format --dry-run --Werror
+
+    - name: Set up cppcheck
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cppcheck
+
+    - name: Run cppcheck
+      run: |
+        cppcheck --enable=all --error-exitcode=1 --suppress=missingIncludeSystem src/
+
+    - name: Set up clang-tidy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-tidy
+
+    - name: Run clang-tidy
+      run: |
+        find src -name "*.cpp" | xargs clang-tidy -p build/
+
+  # Security scanning
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Performance testing
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up performance testing environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libboost-all-dev libmysqlclient-dev
+
+    - name: Build for performance testing
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=ON
+        cmake --build build --config Release --parallel
+
+    - name: Run performance tests
+      run: |
+        # Run performance tests with timeout
+        timeout 300 ctest --test-dir build --output-on-failure -R performance
+
+    - name: Upload performance results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: performance-results
+        path: build/performance-results/
+
+  # Database migration testing
+  database-test:
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: Torrents
+          MYSQL_USER: keynetworks
+          MYSQL_PASSWORD: K3yn3tw0rk5
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up database testing environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libboost-all-dev libmysqlclient-dev
+
+    - name: Build for database testing
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=ON
+        cmake --build build --config Release --parallel
+
+    - name: Wait for MySQL
+      run: |
+        while ! mysqladmin ping -h"127.0.0.1" -P3306 -u"keynetworks" -p"K3yn3tw0rk5" --silent; do
+          echo "Waiting for MySQL..."
+          sleep 2
+        done
+
+    - name: Run database tests
+      run: |
+        ctest --test-dir build --output-on-failure -R database
+
+    - name: Test database migrations
+      run: |
+        cd database/migrations
+        chmod +x run_migrations.sh
+        ./run_migrations.sh --create-tables
+        ./run_migrations.sh --migrate-data
+
+  # Build and deploy
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality, security-scan, performance-test, database-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake libboost-all-dev libmysqlclient-dev
+
+    - name: Build release
+      run: |
+        cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=OFF
+        cmake --build build --config Release --parallel
+
+    - name: Create release package
+      run: |
+        mkdir -p release
+        cp build/dht_crawler release/
+        cp README.md release/
+        cp LICENSE release/
+        tar -czf dht_crawler-release.tar.gz release/
+
+    - name: Upload release artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-package
+        path: dht_crawler-release.tar.gz
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dht_crawler-release.tar.gz
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Notify on completion
+  notify:
+    runs-on: ubuntu-latest
+    needs: [build-and-test, code-quality, security-scan, performance-test, database-test, build-and-deploy]
+    if: always()
+
+    steps:
+    - name: Notify success
+      if: ${{ needs.build-and-test.result == 'success' && needs.code-quality.result == 'success' && needs.security-scan.result == 'success' && needs.performance-test.result == 'success' && needs.database-test.result == 'success' }}
+      run: |
+        echo "✅ All CI/CD pipeline steps completed successfully!"
+
+    - name: Notify failure
+      if: ${{ needs.build-and-test.result == 'failure' || needs.code-quality.result == 'failure' || needs.security-scan.result == 'failure' || needs.performance-test.result == 'failure' || needs.database-test.result == 'failure' }}
+      run: |
+        echo "❌ CI/CD pipeline failed. Check the logs for details."

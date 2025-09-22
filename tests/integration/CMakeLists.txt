@@ -9,10 +9,18 @@ add_executable(integration_tests
 )
 
 # Link with Google Test only (tests are self-contained)
-target_link_libraries(integration_tests
-    GTest::gtest
-    GTest::gtest_main
-)
+# Force static linking for macOS
+if(APPLE)
+    target_link_libraries(integration_tests
+        /opt/homebrew/lib/libgtest.a
+        /opt/homebrew/lib/libgtest_main.a
+    )
+else()
+    target_link_libraries(integration_tests
+        GTest::gtest
+        GTest::gtest_main
+    )
+endif()
 
 # Include directories
 target_include_directories(integration_tests PRIVATE
@@ -20,6 +28,7 @@ target_include_directories(integration_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/tests
     ${LIBTORRENT_INCLUDE_DIRS}
     ${MYSQL_INCLUDE_DIRS}
+    /opt/homebrew/include
 )
 
 # Compiler definitions for testing
